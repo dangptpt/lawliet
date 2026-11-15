@@ -81,8 +81,11 @@ lawliet/
 │   ├── filter/                # lexer, parser, evaluator
 │   ├── snapshot/              # .lwdb writer / reader
 │   └── server/servertest/     # test server + RESP client for integration tests
-├── examples/python/           # RAG demo scripts
-├── scripts/e2e/               # end-to-end checks against a running server
+├── examples/python/           # RAG demo (no model download needed)
+├── scripts/e2e/               # end-to-end checks; run_all.sh runs them all
+├── scripts/bench/             # end-to-end benchmark
+├── .github/workflows/ci.yml   # gofmt, vet, race tests, e2e, docker build + smoke test
+├── Dockerfile                 # distroless, non-root, listens on 0.0.0.0 in the container
 ├── DESIGN.md
 ├── README.md
 └── LICENSE
@@ -639,7 +642,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | **M3** TTL ✅ | `EX/PX`, `VEXPIRE/VTTL/VPERSIST`, lazy + active expiry | Records disappear after TTL; `VTTL` matches Redis semantics |
 | **M4** Limits & eviction ✅ | MemTracker, `maxmemory`, `max_vectors`, 3 policies, `VCONFIG`, `VINFO`, `INFO` | Eviction tests per policy; `noeviction` returns errors |
 | **M5** Snapshot ✅ | `.lwdb` writer/reader, save rules, `SAVE`, shutdown save, startup load | Restart restores identical search results; corrupt file detected |
-| **M6** Release | README quickstart, Python RAG example, Dockerfile, GitHub Actions CI, benchmark script | `docker run` + example works end-to-end |
+| **M6** Release ✅ | README quickstart, Python RAG example, Dockerfile, GitHub Actions CI, benchmark script | `docker run` + example works end-to-end |
 
 ### Phase 2 (after MVP)
 

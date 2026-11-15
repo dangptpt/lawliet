@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "Not gofmt'ed:"; echo "$unformatted"; exit 1; fi
+      - name: go vet
+        run: go vet ./...
+      - name: unit and integration tests
+        run: go test -race -count=1 ./...
+
+  e2e:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r examples/python/requirements.txt
+      - name: end-to-end checks
+        run: scripts/e2e/run_all.sh
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build image
+        run: docker build --build-arg VERSION=${GITHUB_SHA::7} -t lawliet:ci .
+      - name: smoke test
+        run: |
+          docker run -d --name lawliet -p 6380:6380 lawliet:ci
+          for i in $(seq 1 50); do
+            if printf 'PING\r\n' | nc -w 1 127.0.0.1 6380 | grep -q PONG; then echo "PONG"; exit 0; fi
+            sleep 0.2
+          done
+          docker logs lawliet
+          exit 1

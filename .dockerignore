@@ -1,0 +1,6 @@
+bin/
+.git/
+.github/
+**/*.lwdb
+**/*.lwdb.tmp
+**/__pycache__/
