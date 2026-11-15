@@ -27,7 +27,8 @@ r.execute_command("VCREATE", "docs", "DIM", 1536, "METRIC", "cosine")
 ### 1.1 Goals
 
 - Zero-config, single binary, starts in milliseconds.
-- RESP2 wire compatibility: usable from `redis-cli`, `redis-py`, `ioredis`, `go-redis`, ... via raw commands.
+- RESP2 + RESP3 wire compatibility: usable from `redis-cli`, `redis-py`, `ioredis`, `go-redis`, ... via raw commands,
+  with each client's default protocol settings.
 - Exact (Flat) vector search with metadata filtering.
 - Cache-oriented features: per-record TTL, memory limits, per-collection eviction policies.
 - Optional snapshot persistence to a single local file.
@@ -38,7 +39,7 @@ r.execute_command("VCREATE", "docs", "DIM", 1536, "METRIC", "cosine")
 - Datasets larger than RAM.
 - Object storage, segments, WAL/AOF.
 - Authentication / TLS (bind to `127.0.0.1` by default).
-- RESP3, HTTP/REST API (planned later).
+- HTTP/REST API (planned later).
 
 ---
 
@@ -48,7 +49,7 @@ r.execute_command("VCREATE", "docs", "DIM", 1536, "METRIC", "cosine")
 ┌──────────────────────────────────────────────┐
 │ TCP listener (net)  — 1 goroutine / conn     │
 ├──────────────────────────────────────────────┤
-│ RESP2 reader / writer                        │
+│ RESP2/RESP3 reader / writer                  │
 ├──────────────────────────────────────────────┤
 │ Command dispatcher  (V*, SAVE, courtesy cmds)│
 ├──────────────────────────────────────────────┤
@@ -71,7 +72,7 @@ lawliet/
 ├── cmd/lawliet/main.go        # flags, wiring, signal handling
 ├── internal/
 │   ├── config/                # flag parsing, size parsing ("2gb")
-│   ├── resp/                  # RESP2 parser + writer
+│   ├── resp/                  # RESP parser + writer (RESP2/RESP3)
 │   ├── server/                # TCP server, connection loop, dispatch
 │   ├── command/               # one file per command group
 │   ├── store/                 # Store, Collection, slab, memtracker, eviction, ttl
@@ -177,7 +178,23 @@ type Index interface {
 
 ### 4.1 Protocol
 
-RESP2 only. `HELLO 3` → `-NOPROTO`. Clients should fall back to RESP2.
+RESP2 by default; a connection switches to RESP3 with `HELLO 3` (and back with `HELLO 2`).
+
+Why RESP3 is required: redis-py 8.1.0 defaults to RESP3, sends `HELLO 3` on connect,
+does not fall back to RESP2 on `-NOPROTO`, and checks `proto == 3` in the reply
+(verified against redis-py 8.1.0 source).
+
+The protocol is stored per connection in the reply writer. Command handlers use
+version-neutral writer methods; only these types are encoded differently:
+
+| Type   | RESP2                     | RESP3      |
+|--------|---------------------------|------------|
+| null   | `$-1` / `*-1`             | `_`        |
+| map    | flat array `*2n`          | `%n`       |
+| double | bulk string               | `,<float>` |
+
+Not implemented (not needed yet): sets, pushes, attributes, big numbers, verbatim strings,
+client-side caching (`CLIENT TRACKING`).
 
 ### 4.2 Vector encoding
 
@@ -206,7 +223,7 @@ Always **similarity, higher is better**:
 | `ip`     | dot product               |
 | `l2`     | `-euclidean_distance`     |
 
-Scores are returned as bulk strings (RESP2 has no double type).
+Scores are written with `WriteDouble`: RESP3 double, or bulk string in RESP2.
 
 ---
 
@@ -278,7 +295,7 @@ Synchronous. Serialized with automatic snapshots via a mutex.
 |-----------------------------------|----------------------------------------|
 | `PING [msg]`                      | `+PONG` or echo                        |
 | `ECHO msg`                        | echo                                   |
-| `HELLO [2]`                       | server info; `HELLO 3` → `-NOPROTO`     |
+| `HELLO [2\|3] [SETNAME n]`        | switch protocol; map with server, version, proto, id, mode, role, modules; other versions → `-NOPROTO` |
 | `SELECT 0`                        | `+OK`; other → error                   |
 | `CLIENT SETNAME/SETINFO/GETNAME`  | `+OK` / name                           |
 | `COMMAND`, `COMMAND DOCS`         | empty array                            |
@@ -494,7 +511,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | `-ERR max_vectors reached`                                   | limit hit with `noeviction`   |
 | `-OOM command not allowed when used memory > 'maxmemory'`    | memory limit, cannot evict    |
 | `-ERR snapshot disabled: start server with --dir`            | `SAVE` without `--dir`        |
-| `-NOPROTO unsupported protocol version`                      | `HELLO 3`                     |
+| `-NOPROTO unsupported protocol version`                      | `HELLO` with version other than 2/3 |
 
 ---
 
@@ -504,7 +521,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 
 | Milestone | Scope | Done when |
 |-----------|-------|-----------|
-| **M0** Skeleton | RESP2 parser/writer, TCP server, courtesy commands | `redis-cli -p 6380 ping` → `PONG`; `redis-py` connects |
+| **M0** Skeleton ✅ | RESP2/RESP3 parser/writer, TCP server, courtesy commands | `redis-cli -p 6380 ping` → `PONG`; `redis-py` connects with default settings |
 | **M1** Core vectors | Collections, slab, `VADD/VGET/VDEL/VEXISTS/VCOUNT`, `VALUES`/`FP32`, Flat `VSEARCH` (no filter) | Python script inserts 10k vectors and gets correct top-K vs NumPy |
 | **M2** Metadata & filter | `TEXT`, `META`, filter lexer/parser/evaluator, `WITH*` flags | Filter unit tests incl. `and/or/not/()`, `in`, `contains` |
 | **M3** TTL | `EX/PX`, `VEXPIRE/VTTL/VPERSIST`, lazy + active expiry | Records disappear after TTL; `VTTL` matches Redis semantics |
@@ -515,7 +532,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 ### Phase 2 (after MVP)
 
 - HNSW index (behind `Index` interface)
-- RESP3, HTTP/REST API
+- HTTP/REST API
 - Batch insert command
 - Metadata secondary index for faster filtering
 - Quantization (int8 / binary), float16

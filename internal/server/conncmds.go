@@ -51,17 +51,20 @@ func cmdSelect(c *Conn, args [][]byte) {
 }
 
 // HELLO [protover [AUTH username password] [SETNAME clientname]]
+// protover 2 or 3 switches the connection protocol; without it the current one is kept.
 func cmdHello(c *Conn, args [][]byte) {
+	proto := c.w.Proto()
 	if len(args) >= 2 {
 		ver, err := strconv.Atoi(string(args[1]))
 		if err != nil {
 			c.w.WriteError("ERR Protocol version is not an integer or out of range")
 			return
 		}
-		if ver != 2 {
+		if ver != 2 && ver != 3 {
 			c.w.WriteError("NOPROTO unsupported protocol version")
 			return
 		}
+		proto = ver
 	}
 	name := c.name
 	for i := 2; i < len(args); i++ {
@@ -89,15 +92,17 @@ func cmdHello(c *Conn, args [][]byte) {
 			return
 		}
 	}
+	// All arguments are valid: apply changes. The HELLO reply itself uses the new protocol.
 	c.name = name
+	c.w.SetProto(proto)
 
-	c.w.WriteArrayHeader(14)
+	c.w.WriteMapHeader(7)
 	c.w.WriteBulkString("server")
 	c.w.WriteBulkString("lawliet")
 	c.w.WriteBulkString("version")
 	c.w.WriteBulkString(version.Version)
 	c.w.WriteBulkString("proto")
-	c.w.WriteInt(2)
+	c.w.WriteInt(int64(proto))
 	c.w.WriteBulkString("id")
 	c.w.WriteInt(c.id)
 	c.w.WriteBulkString("mode")

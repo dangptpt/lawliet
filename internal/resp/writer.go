@@ -3,19 +3,36 @@ package resp
 import (
 	"bufio"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 )
 
-// Writer buffers RESP2 replies. Write errors are sticky and surface on Flush.
+// Writer buffers RESP replies. Write errors are sticky and surface on Flush.
+//
+// The protocol version (2 or 3) is per connection and switched by HELLO.
+// Types that differ between versions (null, map, double) are encoded
+// automatically; command handlers do not need to know the version.
 type Writer struct {
-	bw  *bufio.Writer
-	num []byte
+	bw    *bufio.Writer
+	num   []byte
+	proto int
 }
 
-// NewWriter returns a buffered Writer.
+// NewWriter returns a buffered Writer speaking RESP2.
 func NewWriter(w io.Writer) *Writer {
-	return &Writer{bw: bufio.NewWriterSize(w, 64<<10), num: make([]byte, 0, 24)}
+	return &Writer{bw: bufio.NewWriterSize(w, 64<<10), num: make([]byte, 0, 32), proto: 2}
+}
+
+// Proto returns the protocol version in use (2 or 3).
+func (w *Writer) Proto() int { return w.proto }
+
+// SetProto switches the protocol version. Only 2 and 3 are valid.
+func (w *Writer) SetProto(p int) {
+	if p != 2 && p != 3 {
+		panic("resp: invalid protocol version " + strconv.Itoa(p))
+	}
+	w.proto = p
 }
 
 var lineBreaks = strings.NewReplacer("\r", " ", "\n", " ")
@@ -46,14 +63,57 @@ func (w *Writer) WriteBulkString(s string) {
 	w.bw.WriteString("\r\n")
 }
 
-// WriteNull writes a null bulk string "$-1\r\n".
-func (w *Writer) WriteNull() { w.bw.WriteString("$-1\r\n") }
+// WriteNull writes a null value: "$-1" (RESP2) or "_" (RESP3).
+func (w *Writer) WriteNull() {
+	if w.proto == 3 {
+		w.bw.WriteString("_\r\n")
+		return
+	}
+	w.bw.WriteString("$-1\r\n")
+}
 
-// WriteNullArray writes a null array "*-1\r\n".
-func (w *Writer) WriteNullArray() { w.bw.WriteString("*-1\r\n") }
+// WriteNullArray writes a null array: "*-1" (RESP2) or "_" (RESP3).
+func (w *Writer) WriteNullArray() {
+	if w.proto == 3 {
+		w.bw.WriteString("_\r\n")
+		return
+	}
+	w.bw.WriteString("*-1\r\n")
+}
 
 // WriteArrayHeader writes "*n\r\n"; the caller then writes n values.
 func (w *Writer) WriteArrayHeader(n int) { w.header('*', int64(n)) }
+
+// WriteMapHeader starts a map of n key/value pairs; the caller then writes 2n values.
+// RESP3: "%n". RESP2: flat array "*2n" (same as Redis).
+func (w *Writer) WriteMapHeader(n int) {
+	if w.proto == 3 {
+		w.header('%', int64(n))
+		return
+	}
+	w.header('*', int64(2*n))
+}
+
+// WriteDouble writes a float. RESP3: ",<f>" (inf, -inf, nan allowed).
+// RESP2: bulk string with the same text.
+func (w *Writer) WriteDouble(f float64) {
+	var s string
+	switch {
+	case math.IsInf(f, 1):
+		s = "inf"
+	case math.IsInf(f, -1):
+		s = "-inf"
+	case math.IsNaN(f):
+		s = "nan"
+	default:
+		s = strconv.FormatFloat(f, 'g', -1, 64)
+	}
+	if w.proto == 3 {
+		w.line(',', s)
+		return
+	}
+	w.WriteBulkString(s)
+}
 
 // Flush sends buffered replies.
 func (w *Writer) Flush() error { return w.bw.Flush() }

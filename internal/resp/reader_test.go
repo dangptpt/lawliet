@@ -129,3 +129,24 @@ func TestReadValueEOF(t *testing.T) {
 		t.Fatalf("truncated array: want ErrUnexpectedEOF, got %v", err)
 	}
 }
+
+func TestReadValueRESP3(t *testing.T) {
+	r := NewReader(strings.NewReader("_\r\n,1.5\r\n#t\r\n%2\r\n$1\r\na\r\n:1\r\n$1\r\nb\r\n_\r\n"))
+	if v, _ := r.ReadValue(); v.Type != '_' || !v.Null {
+		t.Errorf("null: %+v", v)
+	}
+	if v, _ := r.ReadValue(); v.Type != ',' || v.Str != "1.5" {
+		t.Errorf("double: %+v", v)
+	}
+	if v, _ := r.ReadValue(); v.Type != '#' || !v.Bool {
+		t.Errorf("bool: %+v", v)
+	}
+	v, err := r.ReadValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := v.Map()
+	if v.Type != '%' || len(m) != 2 || m["a"].Int != 1 || !m["b"].Null {
+		t.Errorf("map: %+v", v)
+	}
+}

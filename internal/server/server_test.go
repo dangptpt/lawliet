@@ -127,16 +127,51 @@ func TestSelect(t *testing.T) {
 	wantErrPrefix(t, c.do("SELECT", "x"), "ERR value is not an integer")
 }
 
-func TestHello(t *testing.T) {
+func TestHelloRESP2(t *testing.T) {
 	c := dial(t, startServer(t))
 	v := c.do("HELLO", "2", "SETNAME", "app1")
-	if v.Type != '*' || len(v.Array) != 14 || v.Array[1].Str != "lawliet" || v.Array[5].Int != 2 {
+	m := v.Map()
+	if v.Type != '*' || len(v.Array) != 14 || m["server"].Str != "lawliet" || m["proto"].Int != 2 {
 		t.Fatalf("unexpected HELLO reply: %+v", v)
 	}
 	wantBulk(t, c.do("CLIENT", "GETNAME"), "app1")
-	wantErrPrefix(t, c.do("HELLO", "3"), "NOPROTO")
+	wantErrPrefix(t, c.do("HELLO", "4"), "NOPROTO")
 	wantErrPrefix(t, c.do("HELLO", "x"), "ERR Protocol version")
 	wantErrPrefix(t, c.do("HELLO", "2", "AUTH", "u", "p"), "ERR AUTH is not supported")
+}
+
+func TestHelloRESP3(t *testing.T) {
+	c := dial(t, startServer(t))
+
+	// Null before switching: RESP2 encoding.
+	if v := c.do("CLIENT", "GETNAME"); v.Type != '$' || !v.Null {
+		t.Fatalf("RESP2 null: %+v", v)
+	}
+
+	v := c.do("HELLO", "3")
+	m := v.Map()
+	if v.Type != '%' || len(m) != 7 || m["proto"].Int != 3 || m["server"].Str != "lawliet" {
+		t.Fatalf("unexpected HELLO 3 reply: %+v", v)
+	}
+
+	// After switching: RESP3 null.
+	if v := c.do("CLIENT", "GETNAME"); v.Type != '_' || !v.Null {
+		t.Fatalf("RESP3 null: %+v", v)
+	}
+
+	// HELLO without version keeps RESP3; invalid HELLO does not change protocol.
+	if v := c.do("HELLO"); v.Type != '%' || v.Map()["proto"].Int != 3 {
+		t.Fatalf("HELLO (no version): %+v", v)
+	}
+	wantErrPrefix(t, c.do("HELLO", "2", "SETNAME", "bad name"), "ERR Client names")
+	if v := c.do("HELLO"); v.Type != '%' {
+		t.Fatalf("protocol changed after failed HELLO: %+v", v)
+	}
+
+	// Switching back to RESP2.
+	if v := c.do("HELLO", "2"); v.Type != '*' || v.Map()["proto"].Int != 2 {
+		t.Fatalf("HELLO 2: %+v", v)
+	}
 }
 
 func TestClient(t *testing.T) {
