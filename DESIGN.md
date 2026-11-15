@@ -41,6 +41,24 @@ r.execute_command("VCREATE", "docs", "DIM", 1536, "METRIC", "cosine")
 - Authentication / TLS (bind to `127.0.0.1` by default).
 - HTTP/REST API (planned later).
 
+### 1.3 Positioning
+
+Lawliet is a **semantic cache and vector store for LLM applications**, not a general-purpose
+vector database. It does not try to beat Chroma, FAISS or RediSearch on scale or recall; it
+aims to be the simplest way to put a semantic cache and a small document store next to an
+LLM app.
+
+Differentiators to build on (v0.1.0 already has the first three):
+
+- Per-collection eviction policies: documents (`noeviction`) and a cache (`allkeys-lru`,
+  `volatile-ttl`) in one server.
+- One command stores vector + text + metadata + TTL (`VADD`), no schema to declare.
+- Single Apache-2.0 binary, used through existing Redis clients.
+- Planned (§16): built-in semantic cache commands (`VCACHE.*`), LangChain / LlamaIndex
+  adapters, server-side embedding.
+
+Known gaps vs. those projects: no approximate index yet, no SIMD, no ecosystem integrations.
+
 ---
 
 ## 2. Architecture
@@ -646,16 +664,26 @@ Bad magic / version / CRC → refuse to start with a clear error.
 
 ### Phase 2 (after MVP)
 
-- HNSW index (behind `Index` interface)
+Ordered by priority (agreed 2026-11-15). Items 1–4 have draft designs in §16; each is
+finalized step by step before implementation, like the MVP commands.
+
+| # | Item | Why this order |
+|---|------|----------------|
+| 1 | `VCACHE.*` semantic cache commands (§16.1) | the main differentiator; builds on TTL + eviction |
+| 2 | LangChain & LlamaIndex adapters (§16.2) | how users discover and try Lawliet |
+| 3 | Approximate index: spike IVF + e-means vs HNSW, then implement the winner (§16.3) | needed beyond ~100k vectors per collection |
+| 4 | Server-side embedding on `VADD` / `VSEARCH` (§16.4) | demos without embedding code |
+| 5 | Return empty slab chunks / compact slabs (TD-1, §8.2) | makes `maxmemory` bound real memory |
+
+Later, unordered:
+
 - HTTP/REST API
-- Batch insert command
+- Batch insert command; delete by filter
 - Metadata secondary index for faster filtering
 - Quantization (int8 / binary), float16
 - Parallel Flat search, SIMD distance
 - AUTH / TLS
-- LangChain & LlamaIndex adapters
 - Chunked/incremental snapshot to reduce write blocking
-- Return empty slab chunks / compact slabs so evicted memory is really freed (§8.2, TD-1)
 
 ---
 
@@ -663,3 +691,132 @@ Bad magic / version / CRC → refuse to start with a clear error.
 
 - Go module path: `github.com/tranbaohieu/lawliet`
 - Default port: `6380`
+
+---
+
+## 16. Phase 2 Proposals (draft)
+
+Status: **draft**. Names, syntax and defaults below are proposals to discuss, not decisions.
+Open questions are listed per item.
+
+### 16.1 Semantic cache commands (`VCACHE.*`)
+
+Today a semantic cache needs three client-side steps (see `examples/python/rag_demo.py`):
+`VSEARCH ... K 1`, compare the score with a threshold, then `VADD ... EX`. `VCACHE.*` makes
+this one round trip per lookup, with server-side hit/miss statistics.
+
+A cache is an ordinary collection (any policy; `allkeys-lru` or `volatile-ttl` recommended),
+with optional cache defaults:
+
+```
+VCREATE answers DIM 1536 POLICY allkeys-lru MAX_VECTORS 100000
+        CACHE_THRESHOLD 0.92 CACHE_TTL 3600          # new, optional
+
+VCACHE.GET answers (FP32 <blob> | VALUES <n> v...)
+           [THRESHOLD <s>] [FILTER <expr>] [WITHMETA]
+    → hit:  [id, score, text, (meta_json)]           # best match with score >= threshold
+    → miss: null
+
+VCACHE.SET answers <id> (FP32 <blob> | VALUES <n> v...) TEXT <answer>
+           [META <json>] [EX <sec> | PX <ms>]        # default TTL = CACHE_TTL
+
+VCACHE.STATS answers
+    → map: hits, misses, hit_rate, avg_hit_score, entries
+
+VCACHE.INVALIDATE answers FILTER <expr>             # e.g. model == "old-model"
+    → number of entries removed
+```
+
+- A hit counts as an access for LRU (same as `VGET`).
+- `FILTER` scopes the cache, e.g. `model == "gpt-x" and prompt_version == 3`, so answers
+  produced under another model or system prompt are never served.
+
+Open questions:
+
+- Default threshold when neither the command nor the collection sets one (or require it?).
+- Should a hit refresh the TTL (sliding expiration) — optional `TOUCH` flag?
+- Is `VCACHE.INVALIDATE` a cache-only command, or a general `VDEL ... FILTER`?
+- Stats persistence: in memory only, reset on restart?
+
+### 16.2 LangChain & LlamaIndex adapters
+
+A Python package (working name `lawliet-py`, in `clients/python/` of this repo or a separate
+repo) providing:
+
+- **LangChain**: a vector store (add texts with metadata, similarity search with scores,
+  delete, metadata filter dict → `FILTER` expression) and a semantic cache backed by
+  `VCACHE.*`.
+- **LlamaIndex**: a vector store integration with the same mapping.
+- A thin client (`Lawliet(...)`) wrapping raw commands with NumPy-friendly helpers
+  (float32 little-endian encoding, RESP2/RESP3 reply normalization).
+
+Open questions:
+
+- Package name, location and PyPI publishing; supported LangChain / LlamaIndex versions.
+- Interface names to implement must be checked against the current LangChain / LlamaIndex
+  docs before starting (not verified here).
+- Mapping rules from their filter syntax to Lawliet `FILTER` (unsupported operators → error).
+
+### 16.3 Approximate index: IVF + e-means vs HNSW
+
+The flat index takes ~54 ms per query at 100k × 1536 (README). An approximate index is
+needed beyond ~100k vectors per collection. Two candidates, behind the existing `Index`
+interface (§3.5):
+
+| | HNSW | IVF-Flat trained with e-means |
+|---|---|---|
+| Insert | insert into a graph | assign to nearest centroid (cheap) |
+| Delete (TTL, eviction) | tombstones; the graph degrades and needs rebuilds | remove from a posting list (cheap) |
+| Extra memory | graph edges | centroids + posting lists |
+| Weak point | churn-heavy workloads | centroids drift as data changes → periodic retraining |
+
+Why IVF is considered: a semantic cache has heavy churn (TTL, eviction). e-means (FAIR at
+Meta, arXiv 2611.09501, code in Faiss `contrib/e_means`) reports reaching the loss of 25
+Lloyd k-means iterations in 1.4–2.6 epochs, which would make periodic background retraining
+cheap. Its core is simple to port to Go: per cluster a decayed count `N_j` and sum `S_j`
+updated per mini-batch (`N ← γN + (1−γ)n`, `S ← γS + (1−γ)s`, centroid `= S/N`), a cosine
+step-size schedule, and revival of clusters whose count falls below 10% of the mean.
+Caveat: its reported gains are measured at 11M–11B vectors and mostly on GPU; gains at
+Lawliet's scale (CPU, ~100k per collection) are unknown.
+
+Plan: a **spike** before committing to one design.
+
+1. Implement IVF-Flat (e-means training in Go) and a minimal HNSW behind `Index`.
+2. Measure on 100k–1M vectors, dim 384 and 1536: recall@10, p50/p99 latency, build /
+   retrain time, memory, and recall after replacing 30% of records (cache churn).
+3. Pick by the numbers; record the decision and results here.
+
+Open questions:
+
+- `Index` interface additions: `Train` / `Rebuild` hooks, background retraining trigger
+  (e.g. % of records changed since last training), snapshot of the index vs rebuild on load.
+- User-facing parameters: `INDEX ivf NLIST n NPROBE p` / `INDEX hnsw M m EF ef`, and
+  per-query overrides in `VSEARCH`.
+- Filtered search with ANN (pre-filter vs post-filter, fallback to flat for selective filters).
+
+### 16.4 Server-side embedding
+
+Let the server compute embeddings so clients can send text only:
+
+```
+lawliet --embed-provider ollama --embed-url http://localhost:11434 --embed-model nomic-embed-text
+        # API keys for hosted providers come from environment variables, never from flags
+
+VCREATE docs DIM 768 EMBED default                  # collection uses the server embedder
+VADD    docs doc:1 TEXT "Employees get 12 days of paid leave."   # no vector: server embeds TEXT
+VSEARCH docs QUERY "how many leave days?" K 5        # QUERY instead of FP32/VALUES
+VCACHE.GET answers QUERY "when is salary paid?"
+```
+
+Concerns:
+
+- Latency and failures of a network call inside a command: timeouts, retries, error replies.
+- Pipelines: batch embedding requests instead of one call per `VADD`.
+- `DIM` must match the model; check on `VCREATE` (probe call) or on first use.
+- Privacy: with a hosted provider, text leaves the machine; document clearly, default off.
+- Snapshots store vectors as today; the embedder config is not persisted.
+
+Open questions:
+
+- Which providers first (Ollama local, OpenAI-compatible HTTP API)?
+- Should the server also keep a small embedding cache (same text → same vector)?
