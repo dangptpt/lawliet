@@ -29,5 +29,6 @@ run examples/python/rag_demo.py
 # These start their own servers with specific flags.
 run scripts/e2e/m4_limits.py --bin ./bin/lawliet
 run scripts/e2e/m5_snapshot.py --bin ./bin/lawliet
+run scripts/e2e/vcache.py --bin ./bin/lawliet
 
 exit "$status"

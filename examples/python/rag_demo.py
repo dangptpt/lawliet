@@ -1,4 +1,4 @@
-"""Minimal RAG demo on Lawliet: ingest, filtered retrieval and a semantic cache.
+"""Minimal RAG demo on Lawliet: ingest, filtered retrieval and a semantic cache (VCACHE).
 
 Runs without model downloads or API keys: `embed()` uses a hashing
 bag-of-words embedder so the example works anywhere. Replace `embed()` with a
@@ -62,8 +62,12 @@ def setup(r: redis.Redis) -> None:
     # Documents: never evicted.
     r.execute_command("VCREATE", "docs", "DIM", DIM, "METRIC", "cosine")
     # Semantic cache: bounded, least recently used answers are evicted first.
+    # CACHE_THRESHOLD: similarity above which a cached answer is reused. 0.85 suits
+    # the demo embedder; tune it for your model (often 0.9-0.95 for sentence embeddings).
+    # CACHE_TTL: default lifetime of a cached answer (seconds).
     r.execute_command("VCREATE", "answers", "DIM", DIM, "METRIC", "cosine",
-                      "MAX_VECTORS", 1000, "POLICY", "allkeys-lru")
+                      "MAX_VECTORS", 1000, "POLICY", "allkeys-lru",
+                      "CACHE_THRESHOLD", 0.85, "CACHE_TTL", 3600)
 
     pipe = r.pipeline(transaction=False)
     for i, (source, topic, text) in enumerate(DOCS):
@@ -81,27 +85,19 @@ def retrieve(r: redis.Redis, question: str, k: int = 3, where: str | None = None
             for hit in r.execute_command(*args)]
 
 
-# Similarity above which a cached answer is reused. 0.85 suits the demo
-# embedder; tune it for your model (often 0.9-0.95 for sentence embeddings).
-CACHE_THRESHOLD = 0.85
-
-
 def answer(r: redis.Redis, question: str, where: str | None = None) -> str:
     q = blob(embed(question))
 
-    # 1. Semantic cache: a very similar question answered recently?
-    hit = r.execute_command("VSEARCH", "answers", "FP32", q, "K", 1, "WITHTEXT")
+    # 1. Semantic cache: a similar question answered recently? (one round trip)
+    hit = r.execute_command("VCACHE.GET", "answers", "FP32", q)
     if hit:
-        sim = float(hit[0][1])
-        if sim >= CACHE_THRESHOLD:
-            return f"(cache hit, similarity {sim:.2f}) {hit[0][2].decode()}"
-        print(f"(cache miss, best similarity {sim:.2f} < {CACHE_THRESHOLD})")
+        return f"(cache hit, similarity {float(hit[1]):.2f}) {hit[2].decode()}"
 
-    # 2. Retrieve context, 3. generate, 4. cache the answer for 1 hour.
+    # 2. Retrieve context, 3. generate, 4. cache the answer (TTL = CACHE_TTL).
     chunks = retrieve(r, question, where=where)
     text = generate(question, [c[2] for c in chunks])
     key = "q:" + hashlib.sha1(question.encode()).hexdigest()[:12]
-    r.execute_command("VADD", "answers", key, "FP32", q, "TEXT", text, "EX", 3600)
+    r.execute_command("VCACHE.SET", "answers", key, "FP32", q, "TEXT", text)
     return text
 
 
@@ -121,8 +117,13 @@ def main() -> None:
     print(answer(r, "When is salary paid?"))
     print()
     print(answer(r, "when is the salary paid"))  # near-duplicate question -> cache hit
-    print(f"\ncached answers: {r.execute_command('VCOUNT', 'answers')}, "
-          f"TTL of an answer: {r.execute_command('VTTL', 'answers', 'q:' + hashlib.sha1(b'When is salary paid?').hexdigest()[:12])}s")
+    print()
+    print(answer(r, "how do I connect to the VPN"))  # unrelated question -> miss
+
+    stats = r.execute_command("VCACHE.STATS", "answers")
+    stats = stats if isinstance(stats, dict) else dict(zip(stats[::2], stats[1::2]))
+    print(f"\ncache: {stats[b'entries']} answers, {stats[b'hits']} hits, {stats[b'misses']} misses, "
+          f"hit rate {float(stats[b'hit_rate']):.0%}")
 
 
 if __name__ == "__main__":

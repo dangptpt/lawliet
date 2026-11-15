@@ -18,49 +18,64 @@ func (h *handlers) vadd(c *server.Conn, args [][]byte) {
 		writeErr(c, err)
 		return
 	}
-	vec, i, err := parseVector(args, 3)
+	w, err := parseWrite(args, 3)
 	if err != nil {
 		writeErr(c, err)
 		return
 	}
-	rec := store.Record{Vector: vec}
-	mode := store.Upsert
-	var ttlMs int64 // 0 = no TTL
+	h.applyWrite(c, col, string(args[2]), w)
+}
+
+// writeArgs is a parsed VADD / VCACHE.SET request body.
+type writeArgs struct {
+	rec   store.Record
+	mode  store.AddMode
+	ttlMs int64 // 0 = no TTL given
+}
+
+// parseWrite parses `vector [TEXT s] [META json] [EX s | PX ms] [NX | XX]` from args[i:].
+func parseWrite(args [][]byte, i int) (writeArgs, error) {
+	vec, i, err := parseVector(args, i)
+	if err != nil {
+		return writeArgs{}, err
+	}
+	w := writeArgs{rec: store.Record{Vector: vec}, mode: store.Upsert}
 	for ; i < len(args); i++ {
 		switch {
-		case (isKeyword(args[i], "EX") || isKeyword(args[i], "PX")) && i+1 < len(args) && ttlMs == 0:
+		case (isKeyword(args[i], "EX") || isKeyword(args[i], "PX")) && i+1 < len(args) && w.ttlMs == 0:
 			unit := int64(1000)
 			if isKeyword(args[i], "PX") {
 				unit = 1
 			}
-			if ttlMs, err = parseExpire(args[i+1], unit); err != nil {
-				writeErr(c, err)
-				return
+			if w.ttlMs, err = parseExpire(args[i+1], unit); err != nil {
+				return writeArgs{}, err
 			}
 			i++
 		case isKeyword(args[i], "TEXT") && i+1 < len(args):
-			rec.Text = string(args[i+1])
+			w.rec.Text = string(args[i+1])
 			i++
 		case isKeyword(args[i], "META") && i+1 < len(args):
-			if rec.Meta, err = meta.ParseJSON(args[i+1]); err != nil {
-				writeErr(c, err)
-				return
+			if w.rec.Meta, err = meta.ParseJSON(args[i+1]); err != nil {
+				return writeArgs{}, err
 			}
 			i++
-		case isKeyword(args[i], "NX") && mode != store.OnlyExisting:
-			mode = store.OnlyNew
-		case isKeyword(args[i], "XX") && mode != store.OnlyNew:
-			mode = store.OnlyExisting
+		case isKeyword(args[i], "NX") && w.mode != store.OnlyExisting:
+			w.mode = store.OnlyNew
+		case isKeyword(args[i], "XX") && w.mode != store.OnlyNew:
+			w.mode = store.OnlyExisting
 		default:
-			writeErr(c, errSyntax)
-			return
+			return writeArgs{}, errSyntax
 		}
 	}
+	return w, nil
+}
 
-	if ttlMs > 0 {
-		rec.ExpireAt = h.st.Now() + ttlMs
+// applyWrite stores the record and writes the VADD reply.
+func (h *handlers) applyWrite(c *server.Conn, col *store.Collection, id string, w writeArgs) {
+	if w.ttlMs > 0 {
+		w.rec.ExpireAt = h.st.Now() + w.ttlMs
 	}
-	res, err := col.Add(string(args[2]), rec, mode)
+	res, err := col.Add(id, w.rec, w.mode)
 	if err != nil {
 		writeErr(c, err)
 		return

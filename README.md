@@ -32,6 +32,10 @@ segments, lazy loading. For a test suite, a notebook or a chatbot demo that is a
 of moving parts. Lawliet keeps everything in RAM, speaks RESP2/RESP3 so existing Redis
 clients work unchanged, and adds the features a RAG prototype needs:
 
+- **Semantic cache commands** — `VCACHE.GET` returns a cached answer when a similar
+  question was already answered (threshold in one round trip), `VCACHE.SET` stores it with a
+  default TTL, plus hit/miss statistics and invalidation by filter. Skip search + generation
+  for repeated questions.
 - **Exact vector search** — cosine, L2, inner product.
 - **Text and metadata** stored with each vector, returned with results.
 - **Filters** — `(source == "hr.md" or page >= 2) and not tags contains "draft"`.
@@ -79,7 +83,7 @@ OK
 ### RAG example
 
 [`examples/python/rag_demo.py`](examples/python/rag_demo.py) ingests documents, retrieves
-with filters, and puts a semantic cache (TTL + LRU) in front of the LLM. It runs without
+with filters, and puts a semantic cache (`VCACHE.*`, TTL + LRU) in front of the LLM. It runs without
 model downloads or API keys; swap `embed()` and `generate()` for real models.
 
 ```bash
@@ -91,13 +95,16 @@ python examples/python/rag_demo.py
 
 | Command | Purpose |
 |---|---|
-| `VCREATE col DIM n [METRIC cosine\|l2\|ip] [MAX_VECTORS n] [POLICY p]` | create a collection |
+| `VCREATE col DIM n [METRIC cosine\|l2\|ip] [MAX_VECTORS n] [POLICY p] [CACHE_THRESHOLD s] [CACHE_TTL sec]` | create a collection |
 | `VDROP col` · `VLIST` · `VINFO col` | drop, list, inspect |
-| `VCONFIG col GET` · `VCONFIG col SET POLICY p MAX_VECTORS n` | change limits at runtime |
+| `VCONFIG col GET` · `VCONFIG col SET POLICY p MAX_VECTORS n CACHE_THRESHOLD s CACHE_TTL sec` | change limits / cache defaults at runtime |
 | `VADD col id (FP32 blob \| VALUES n v…) [TEXT s] [META json] [EX s \| PX ms] [NX \| XX]` | insert or replace a record |
 | `VGET col id [WITHVEC]` · `VDEL col id…` · `VEXISTS col id` · `VCOUNT col` | read, delete, check, count |
 | `VSEARCH col (FP32 blob \| VALUES n v…) [K n] [FILTER expr] [WITHTEXT] [WITHMETA] [WITHVEC]` | nearest neighbours |
 | `VEXPIRE col id s` · `VTTL col id` · `VPERSIST col id` | TTL management |
+| `VCACHE.GET col (FP32 blob \| VALUES n v…) [THRESHOLD s] [FILTER expr] [WITHMETA]` | cached answer if score ≥ threshold, else null |
+| `VCACHE.SET col id (FP32 blob \| VALUES n v…) TEXT answer [META json] [EX s \| PX ms]` | store an answer (default TTL = `CACHE_TTL`) |
+| `VCACHE.STATS col` · `VCACHE.INVALIDATE col FILTER expr` | hit/miss stats, remove entries by metadata |
 | `SAVE` · `INFO [section]` · `PING` · `HELLO [2\|3]` | server |
 
 Details — reply formats, filter grammar, errors — are in [DESIGN.md](DESIGN.md).
@@ -168,11 +175,11 @@ Design decisions live in [DESIGN.md](DESIGN.md); known debts in [TECH_DEBT.md](T
 ## Roadmap
 
 Lawliet aims to be a **semantic cache and vector store for LLM apps** rather than a
-general-purpose vector database ([DESIGN.md §1.3](DESIGN.md)). Next, in priority order
+general-purpose vector database ([DESIGN.md §1.3](DESIGN.md)). In priority order
 (drafts in [DESIGN.md §16](DESIGN.md)):
 
-1. **`VCACHE.*` semantic cache commands** — threshold lookup, default TTL, hit/miss stats,
-   invalidation by filter.
+1. ✅ **`VCACHE.*` semantic cache commands** — threshold lookup, default TTL, hit/miss stats,
+   invalidation by filter. Next: optimizations (sliding TTL, per-entry hit counts, ...).
 2. **LangChain and LlamaIndex adapters** — vector store and semantic cache.
 3. **Approximate index** — spike IVF trained with e-means vs HNSW, then implement the winner.
 4. **Server-side embedding** — send text, the server computes vectors (Ollama /

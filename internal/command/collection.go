@@ -1,6 +1,7 @@
 package command
 
 import (
+	"math"
 	"strings"
 
 	"github.com/tranbaohieu/lawliet/internal/index"
@@ -11,8 +12,9 @@ import (
 // VCREATE <col> DIM <n> [METRIC cosine|l2|ip] [INDEX flat]
 //
 //	[MAX_VECTORS <n>] [POLICY noeviction|allkeys-lru|volatile-ttl]
+//	[CACHE_THRESHOLD <score>] [CACHE_TTL <sec>]
 //
-// POLICY defaults to the server's --maxmemory-policy.
+// POLICY defaults to the server's --maxmemory-policy. CACHE_* are defaults for VCACHE.*.
 func (h *handlers) vcreate(c *server.Conn, args [][]byte) {
 	cfg := store.Config{Metric: index.Cosine, Index: "flat", Policy: h.st.Limits().DefaultPolicy}
 	for i := 2; i < len(args); i += 2 {
@@ -52,6 +54,20 @@ func (h *handlers) vcreate(c *server.Conn, args [][]byte) {
 				return
 			}
 			cfg.Policy = p
+		case isKeyword(args[i], "CACHE_THRESHOLD"):
+			f, err := parseFloat(val, "CACHE_THRESHOLD")
+			if err != nil {
+				writeErr(c, err)
+				return
+			}
+			cfg.HasCacheThreshold, cfg.CacheThreshold = true, f
+		case isKeyword(args[i], "CACHE_TTL"):
+			n, err := parseInt(val, "CACHE_TTL", 0, maxTTLMs/1000)
+			if err != nil {
+				writeErr(c, err)
+				return
+			}
+			cfg.CacheTTL = int64(n)
 		default:
 			writeErr(c, errSyntax)
 			return
@@ -95,7 +111,7 @@ func (h *handlers) vinfo(c *server.Conn, args [][]byte) {
 	}
 	info := col.Info()
 	w := c.W()
-	w.WriteMapHeader(10)
+	w.WriteMapHeader(12)
 	w.WriteBulkString("name")
 	w.WriteBulkString(info.Name)
 	w.WriteBulkString("dim")
@@ -112,6 +128,7 @@ func (h *handlers) vinfo(c *server.Conn, args [][]byte) {
 	w.WriteInt(int64(info.Config.MaxVectors))
 	w.WriteBulkString("policy")
 	w.WriteBulkString(info.Config.Policy.String())
+	writeCacheConfig(c, info.Config)
 	w.WriteBulkString("memory_bytes")
 	w.WriteInt(info.MemoryBytes)
 	w.WriteBulkString("vector_bytes")
@@ -134,15 +151,18 @@ func (h *handlers) vconfig(c *server.Conn, args [][]byte) {
 	case isKeyword(args[2], "GET") && len(args) == 3:
 		cfg := col.Config()
 		w := c.W()
-		w.WriteMapHeader(2)
+		w.WriteMapHeader(4)
 		w.WriteBulkString("max_vectors")
 		w.WriteInt(int64(cfg.MaxVectors))
 		w.WriteBulkString("policy")
 		w.WriteBulkString(cfg.Policy.String())
+		writeCacheConfig(c, cfg)
 
 	case isKeyword(args[2], "SET") && len(args) >= 5 && len(args)%2 == 1:
 		var policy *store.Policy
 		maxVectors := -1
+		var threshold *float64 // nil = unchanged; NaN = clear
+		cacheTTL := int64(-1)
 		for i := 3; i < len(args); i += 2 {
 			val := args[i+1]
 			switch {
@@ -158,8 +178,25 @@ func (h *handlers) vconfig(c *server.Conn, args [][]byte) {
 					writeErr(c, err)
 					return
 				}
+			case isKeyword(args[i], "CACHE_THRESHOLD"):
+				f := math.NaN() // NONE clears the default threshold
+				if !isKeyword(val, "NONE") {
+					if f, err = parseFloat(val, "CACHE_THRESHOLD"); err != nil {
+						writeErr(c, err)
+						return
+					}
+				}
+				threshold = &f
+			case isKeyword(args[i], "CACHE_TTL"):
+				n, err := parseInt(val, "CACHE_TTL", 0, maxTTLMs/1000)
+				if err != nil {
+					writeErr(c, err)
+					return
+				}
+				cacheTTL = int64(n)
 			default:
-				writeErr(c, cmdError("unknown or immutable parameter '"+string(args[i])+"' (mutable: POLICY, MAX_VECTORS)"))
+				writeErr(c, cmdError("unknown or immutable parameter '"+string(args[i])+
+					"' (mutable: POLICY, MAX_VECTORS, CACHE_THRESHOLD, CACHE_TTL)"))
 				return
 			}
 		}
@@ -172,9 +209,34 @@ func (h *handlers) vconfig(c *server.Conn, args [][]byte) {
 				return
 			}
 		}
+		if threshold != nil {
+			if err := col.SetCacheThreshold(!math.IsNaN(*threshold), *threshold); err != nil {
+				writeErr(c, err)
+				return
+			}
+		}
+		if cacheTTL >= 0 {
+			if err := col.SetCacheTTL(cacheTTL); err != nil {
+				writeErr(c, err)
+				return
+			}
+		}
 		c.W().WriteOK()
 
 	default:
 		writeErr(c, errSyntax)
 	}
+}
+
+// writeCacheConfig writes the cache_threshold (null if unset) and cache_ttl map entries.
+func writeCacheConfig(c *server.Conn, cfg store.Config) {
+	w := c.W()
+	w.WriteBulkString("cache_threshold")
+	if cfg.HasCacheThreshold {
+		w.WriteDouble(cfg.CacheThreshold)
+	} else {
+		w.WriteNull()
+	}
+	w.WriteBulkString("cache_ttl")
+	w.WriteInt(cfg.CacheTTL)
 }

@@ -44,7 +44,7 @@ func TestCollectionLifecycle(t *testing.T) {
 	want(t, c.Do("VLIST"), `*[$"docs" $"faq"]`)
 
 	want(t, c.Do("VINFO", "docs"),
-		`*[$"name" $"docs" $"dim" :3 $"metric" $"cosine" $"index" $"flat" $"count" :0 $"expires" :0 $"max_vectors" :0 $"policy" $"noeviction" $"memory_bytes" :0 $"vector_bytes" :0]`)
+		`*[$"name" $"docs" $"dim" :3 $"metric" $"cosine" $"index" $"flat" $"count" :0 $"expires" :0 $"max_vectors" :0 $"policy" $"noeviction" $"cache_threshold" nil $"cache_ttl" :0 $"memory_bytes" :0 $"vector_bytes" :0]`)
 	want(t, c.Do("VINFO", "faq").Map()["metric"], `$"l2"`)
 
 	want(t, c.Do("VDROP", "faq"), ":1")

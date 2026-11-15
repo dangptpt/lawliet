@@ -37,9 +37,10 @@ func fill(t *testing.T, s *store.Store, now int64) {
 	t.Helper()
 	r := rand.New(rand.NewPCG(1, 2))
 	cfgs := map[string]store.Config{
-		"docs":  {Dim: 8, Metric: index.Cosine, Index: "flat"},
-		"l2":    {Dim: 3, Metric: index.L2, Index: "flat", MaxVectors: 1000, Policy: store.AllKeysLRU},
-		"cache": {Dim: 4, Metric: index.IP, Index: "flat", Policy: store.VolatileTTL},
+		"docs": {Dim: 8, Metric: index.Cosine, Index: "flat"},
+		"l2":   {Dim: 3, Metric: index.L2, Index: "flat", MaxVectors: 1000, Policy: store.AllKeysLRU},
+		"cache": {Dim: 4, Metric: index.IP, Index: "flat", Policy: store.VolatileTTL,
+			HasCacheThreshold: true, CacheThreshold: 0.925, CacheTTL: 3600},
 		"empty": {Dim: 2, Metric: index.IP, Index: "flat"},
 	}
 	for name, cfg := range cfgs {
@@ -219,6 +220,7 @@ func TestCorruptFiles(t *testing.T) {
 		"empty":          {nil, "bad magic"},
 		"bad magic":      {append([]byte("XXXX"), good[4:]...), "bad magic"},
 		"bad version":    {badVersion, "unsupported snapshot version 99"},
+		"version zero":   {append(append([]byte("LWDB"), 0, 0), good[6:]...), "unsupported snapshot version 0"},
 		"flipped byte":   {flip(len(good) / 2), "corrupt snapshot"},
 		"bad checksum":   {flip(len(good) - 1), "checksum mismatch"},
 		"truncated":      {good[:len(good)/3], "unexpected end of file"},
@@ -365,5 +367,48 @@ func TestRules(t *testing.T) {
 	s.Create("c", store.Config{Dim: 1, Index: "flat"})
 	if !sn.due(start.Add(61 * time.Second)) {
 		t.Fatal("3 changes after 60s: due")
+	}
+}
+
+// testdata/v1.lwdb was written by the format-1 code (v0.1.0): the current
+// reader must still load it, with no cache defaults.
+func TestReadVersion1File(t *testing.T) {
+	data, err := os.ReadFile("testdata/v1.lwdb")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data[4] != 1 || data[5] != 0 {
+		t.Fatalf("fixture is not version 1: % x", data[4:6])
+	}
+	clk := &clock{}
+	clk.ms.Store(1_000_000)
+	st := newStore(clk)
+	stats, err := Read(bytes.NewReader(data), st)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Collections != 1 || stats.Records != 2 {
+		t.Fatalf("stats %+v", stats)
+	}
+	c, _ := st.Get("docs")
+	cfg := c.Config()
+	if cfg.Dim != 2 || cfg.Metric != index.IP || cfg.MaxVectors != 10 || cfg.Policy != store.AllKeysLRU ||
+		cfg.HasCacheThreshold || cfg.CacheTTL != 0 {
+		t.Fatalf("config %+v", cfg)
+	}
+	a, ok := c.Get("a")
+	if !ok || a.Text != "alpha" || a.Meta["k"].S != "v" || a.Vector[0] != 1 || a.Vector[1] != 2 {
+		t.Fatalf("record a: %+v", a)
+	}
+	if b, ok := c.Get("b"); !ok || b.ExpireAt != 4102444800000 {
+		t.Fatalf("record b: %+v", b)
+	}
+}
+
+func TestWritesCurrentVersion(t *testing.T) {
+	var buf bytes.Buffer
+	Write(&buf, newStore(&clock{}))
+	if got := int(buf.Bytes()[4]) | int(buf.Bytes()[5])<<8; got != version || version != 2 {
+		t.Fatalf("written version %d, const %d", got, version)
 	}
 }

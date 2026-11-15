@@ -16,13 +16,13 @@ func TestVCreateLimitsAndVConfig(t *testing.T) {
 	do := func(args ...any) string { return describe(c.Do(args...)) }
 
 	expect(t, do("VCREATE", "a", "DIM", 1), `+"OK"`) // default policy from server
-	expect(t, do("VCONFIG", "a", "GET"), `*[$"max_vectors" :0 $"policy" $"allkeys-lru"]`)
+	expect(t, do("VCONFIG", "a", "GET"), `*[$"max_vectors" :0 $"policy" $"allkeys-lru" $"cache_threshold" nil $"cache_ttl" :0]`)
 
 	expect(t, do("VCREATE", "b", "DIM", 1, "MAX_VECTORS", 2, "POLICY", "noeviction"), `+"OK"`)
-	expect(t, do("VCONFIG", "b", "GET"), `*[$"max_vectors" :2 $"policy" $"noeviction"]`)
+	expect(t, do("VCONFIG", "b", "GET"), `*[$"max_vectors" :2 $"policy" $"noeviction" $"cache_threshold" nil $"cache_ttl" :0]`)
 
 	expect(t, do("VCONFIG", "b", "SET", "POLICY", "volatile-ttl", "MAX_VECTORS", 10), `+"OK"`)
-	expect(t, do("VCONFIG", "b", "GET"), `*[$"max_vectors" :10 $"policy" $"volatile-ttl"]`)
+	expect(t, do("VCONFIG", "b", "GET"), `*[$"max_vectors" :10 $"policy" $"volatile-ttl" $"cache_threshold" nil $"cache_ttl" :0]`)
 
 	errs := []struct {
 		args []any
@@ -43,7 +43,7 @@ func TestVCreateLimitsAndVConfig(t *testing.T) {
 	}
 	// A failed SET changes nothing (all values validated first).
 	do("VCONFIG", "b", "SET", "POLICY", "noeviction", "MAX_VECTORS", "x")
-	expect(t, do("VCONFIG", "b", "GET"), `*[$"max_vectors" :10 $"policy" $"volatile-ttl"]`)
+	expect(t, do("VCONFIG", "b", "GET"), `*[$"max_vectors" :10 $"policy" $"volatile-ttl" $"cache_threshold" nil $"cache_ttl" :0]`)
 }
 
 func TestMaxVectorsCommands(t *testing.T) {

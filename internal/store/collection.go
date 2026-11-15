@@ -23,6 +23,11 @@ type Config struct {
 	Index      string // "flat" (MVP)
 	MaxVectors int    // 0 = unlimited
 	Policy     Policy
+
+	// Semantic cache defaults for VCACHE.* (DESIGN.md §16.1). Mutable.
+	HasCacheThreshold bool    // false = VCACHE.GET must pass THRESHOLD
+	CacheThreshold    float64 // minimum score for a cache hit
+	CacheTTL          int64   // seconds; default TTL for VCACHE.SET, 0 = none
 }
 
 func (c Config) validate() error {
@@ -45,7 +50,12 @@ func (c Config) validate() error {
 	default:
 		return &ConfigError{Msg: "invalid policy"}
 	}
-	return nil
+	if c.HasCacheThreshold {
+		if err := validateCacheThreshold(c.CacheThreshold); err != nil {
+			return err
+		}
+	}
+	return validateCacheTTL(c.CacheTTL)
 }
 
 // AddMode controls VADD behavior for existing IDs.
@@ -81,6 +91,7 @@ type SearchOptions struct {
 	WithVectors bool
 	WithText    bool
 	WithMeta    bool
+	NoTouch     bool // do not count returned records as accessed (LRU); see Touch
 }
 
 // Result is one search hit with its external ID. Optional fields are set
@@ -130,7 +141,8 @@ type Collection struct {
 	freeList   []uint32
 	ttlSlots   map[uint32]struct{} // slots with expireAt != 0
 	live       int
-	memBytes   int64 // estimated memory of this collection's records
+	memBytes   int64      // estimated memory of this collection's records
+	stats      cacheStats // VCACHE.GET counters
 
 	idx index.Index
 }
@@ -376,7 +388,9 @@ func (c *Collection) Search(query []float32, opt SearchOptions) ([]Result, error
 	hits := c.idx.Search(q, opt.K, accept)
 	out := make([]Result, len(hits))
 	for i, h := range hits {
-		c.touch(h.Slot, now)
+		if !opt.NoTouch {
+			c.touch(h.Slot, now)
+		}
 		r := Result{ID: c.slotToID[h.Slot], Score: h.Score}
 		if opt.WithVectors {
 			r.Vector = slices.Clone(c.vectors.Get(h.Slot))

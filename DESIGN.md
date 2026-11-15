@@ -48,14 +48,17 @@ vector database. It does not try to beat Chroma, FAISS or RediSearch on scale or
 aims to be the simplest way to put a semantic cache and a small document store next to an
 LLM app.
 
-Differentiators to build on (v0.1.0 already has the first three):
+Differentiators to build on:
 
-- Per-collection eviction policies: documents (`noeviction`) and a cache (`allkeys-lru`,
-  `volatile-ttl`) in one server.
+- **Semantic cache commands** (`VCACHE.*`, §5.7): threshold lookup in one round trip,
+  default TTL, server-side hit/miss statistics, invalidation by metadata filter — usable
+  from any language through a plain Redis client.
+- Per-collection eviction policies. (Redis can approximate "documents vs. cache" with a
+  `volatile-*` policy when only cache keys have a TTL; Lawliet lets each collection pick its
+  own policy.)
 - One command stores vector + text + metadata + TTL (`VADD`), no schema to declare.
 - Single Apache-2.0 binary, used through existing Redis clients.
-- Planned (§16): built-in semantic cache commands (`VCACHE.*`), LangChain / LlamaIndex
-  adapters, server-side embedding.
+- Planned (§16): LangChain / LlamaIndex adapters, server-side embedding.
 
 Known gaps vs. those projects: no approximate index yet, no SIMD, no ecosystem integrations.
 
@@ -136,6 +139,8 @@ No Redis-style numbered databases. `SELECT 0` returns `OK`; other indexes return
 | `index`       | `flat` (MVP)                                 | no (MVP)|
 | `max_vectors` | int, 0 = unlimited                           | yes     |
 | `policy`      | `noeviction` \| `allkeys-lru` \| `volatile-ttl` (default from server flag) | yes |
+| `cache_threshold` | float, unset by default; default `THRESHOLD` for `VCACHE.GET` | yes |
+| `cache_ttl`   | seconds, 0 = none; default TTL for `VCACHE.SET`             | yes     |
 
 Lowering `max_vectors` below the current count **only blocks new inserts**; existing records are kept.
 
@@ -266,20 +271,26 @@ Scores are written with `WriteDouble`: RESP3 double, or bulk string in RESP2.
 
 ```
 VCREATE <col> DIM <n> [METRIC cosine|l2|ip] [INDEX flat]
-        [MAX_VECTORS <n>] [POLICY noeviction|allkeys-lru|volatile-ttl]   → +OK
+        [MAX_VECTORS <n>] [POLICY noeviction|allkeys-lru|volatile-ttl]
+        [CACHE_THRESHOLD <score>] [CACHE_TTL <sec>]                     → +OK
 VDROP   <col>                                                           → :1 | :0
 VLIST                                                                   → array of names
 VINFO   <col>                                                           → flat key/value array
 VCONFIG <col> GET                                                       → flat key/value array
 VCONFIG <col> SET POLICY <p>                                            → +OK
 VCONFIG <col> SET MAX_VECTORS <n>                                       → +OK
+VCONFIG <col> SET CACHE_THRESHOLD <score|NONE>                          → +OK
+VCONFIG <col> SET CACHE_TTL <sec>                                       → +OK
 ```
 
 `VINFO` reply is a map (flat array in RESP2). Fields: `name, dim, metric, index, count, expires,
-max_vectors, policy, memory_bytes` (estimated, §8.2), `vector_bytes` (allocated slab).
+max_vectors, policy, cache_threshold` (null if unset), `cache_ttl, memory_bytes` (estimated,
+§8.2), `vector_bytes` (allocated slab). `VCONFIG GET` returns `max_vectors, policy,
+cache_threshold, cache_ttl`.
 
 `VCONFIG <col> SET` accepts several `param value` pairs; all are validated before any change is
 applied. Unknown or immutable parameters (`DIM`, `METRIC`, `INDEX`) are rejected.
+`CACHE_THRESHOLD NONE` clears the default threshold.
 
 ### 5.2 Records
 
@@ -352,6 +363,43 @@ Synchronous. Serialized with automatic snapshots via a mutex.
 | `COMMAND`, `COMMAND DOCS`         | empty array                            |
 | `INFO [section]`                  | `server`, `memory`, `stats`, `persistence` |
 | `QUIT`                            | `+OK`, close connection                |
+
+### 5.7 Semantic cache (`VCACHE.*`)
+
+A semantic cache is an ordinary collection; `allkeys-lru` or `volatile-ttl` with
+`MAX_VECTORS` is recommended. The commands add a threshold lookup, a default TTL,
+statistics and invalidation.
+
+```
+VCACHE.GET <col> (FP32 <blob> | VALUES <n> v...) [THRESHOLD <s>] [FILTER <expr>] [WITHMETA]
+    → hit:  [id, score, text, (meta_json)]   best entry with score >= threshold
+    → miss: null
+VCACHE.SET <col> <id> (FP32 <blob> | VALUES <n> v...) TEXT <answer>
+           [META <json>] [EX <sec> | PX <ms>] [NX | XX]
+    → :1 inserted | :0 updated | null (NX/XX not met)
+VCACHE.STATS <col>
+    → map: hits, misses, hit_rate, avg_hit_score, entries
+VCACHE.INVALIDATE <col> FILTER <expr>
+    → number of entries removed
+```
+
+- **Threshold**: `THRESHOLD` on the call, else the collection's `CACHE_THRESHOLD`; if neither
+  is set the call fails. There is no implicit default because the right value depends on
+  the embedding model, and a wrong one serves wrong answers. Scores follow §4.3 (higher is
+  better).
+- **TTL**: `VCACHE.SET` uses `EX`/`PX` if given, else `CACHE_TTL` (0 = no TTL). `TEXT` is
+  required. Otherwise it behaves like `VADD` (update replaces the whole record).
+- **LRU**: only a hit counts as an access. A miss does not touch the nearest entry; otherwise
+  entries that are often "almost" matched would never be evicted.
+- **Scoping**: `FILTER` restricts lookups, e.g. `model == "m1" and prompt_version == 3`, so
+  answers produced under another model or prompt are never served.
+- **Statistics** are per collection, in memory only: they reset on restart and are not in
+  snapshots. `hit_rate` and `avg_hit_score` are 0 before the first lookup / hit.
+- **Invalidation** removes matching entries in one command under the collection write lock;
+  expired entries met on the way are reclaimed but not counted.
+
+Measured (scripts/e2e/vcache.py, dim 384, 200 entries, threshold 0.95): paraphrased queries
+hit the right entry 100/100, unrelated queries miss 100/100, `VCACHE.GET` p50 0.14 ms.
 
 ---
 
@@ -570,6 +618,9 @@ repeat n_coll:
   index      uint8
   max_vec    uint32
   policy     uint8
+  [v2+] has_cache_threshold uint8
+  [v2+] cache_threshold     float64
+  [v2+] cache_ttl_sec       int64
   n_rec      uint32
   repeat n_rec:
     id       str
@@ -588,6 +639,10 @@ Vectors are written in their stored form and restored **bit-exact**: cosine vect
 normalized again on load (re-normalizing changes the float bits of ~50% of vectors and thus
 the scores).
 Bad magic / version / CRC → refuse to start with a clear error.
+
+Versions: **1** = v0.1.0; **2** = adds the cache defaults per collection. The server writes
+the current version and reads every version up to it (a v1 file loads with no cache
+defaults; `internal/snapshot/testdata/v1.lwdb` guards this).
 
 `INFO persistence`: `snapshot_enabled`, `snapshot_path`, `rdb_changes_since_last_save`,
 `rdb_last_save_time`, `rdb_last_save_status`, `rdb_last_save_duration_ms`.
@@ -644,6 +699,9 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | `-OOM command not allowed when used memory > 'maxmemory'`    | memory limit, cannot evict    |
 | `-ERR snapshot disabled: start server with --dir`            | `SAVE` without `--dir`        |
 | `-ERR snapshot failed: <reason>`                             | `SAVE` could not write        |
+| `-ERR no threshold: pass THRESHOLD or set CACHE_THRESHOLD on the collection` | `VCACHE.GET` without a threshold |
+| `-ERR VCACHE.SET requires a non-empty TEXT (the cached answer)` | `VCACHE.SET` without `TEXT` |
+| `-ERR THRESHOLD must be a finite number` (also `CACHE_THRESHOLD`) | bad threshold value     |
 | `-NOPROTO unsupported protocol version`                      | `HELLO` with version other than 2/3 |
 
 ---
@@ -669,7 +727,7 @@ finalized step by step before implementation, like the MVP commands.
 
 | # | Item | Why this order |
 |---|------|----------------|
-| 1 | `VCACHE.*` semantic cache commands (§16.1) | the main differentiator; builds on TTL + eviction |
+| 1 ✅ | `VCACHE.*` semantic cache commands (§5.7; draft §16.1) | the main differentiator; builds on TTL + eviction |
 | 2 | LangChain & LlamaIndex adapters (§16.2) | how users discover and try Lawliet |
 | 3 | Approximate index: spike IVF + e-means vs HNSW, then implement the winner (§16.3) | needed beyond ~100k vectors per collection |
 | 4 | Server-side embedding on `VADD` / `VSEARCH` (§16.4) | demos without embedding code |
@@ -699,44 +757,24 @@ Later, unordered:
 Status: **draft**. Names, syntax and defaults below are proposals to discuss, not decisions.
 Open questions are listed per item.
 
-### 16.1 Semantic cache commands (`VCACHE.*`)
+### 16.1 Semantic cache commands (`VCACHE.*`) — implemented
 
-Today a semantic cache needs three client-side steps (see `examples/python/rag_demo.py`):
-`VSEARCH ... K 1`, compare the score with a threshold, then `VADD ... EX`. `VCACHE.*` makes
-this one round trip per lookup, with server-side hit/miss statistics.
+Implemented as specified in §5.7. Decisions on the open questions of the draft:
 
-A cache is an ordinary collection (any policy; `allkeys-lru` or `volatile-ttl` recommended),
-with optional cache defaults:
+| Question | Decision |
+|---|---|
+| Default threshold | none: `THRESHOLD` or `CACHE_THRESHOLD` is required |
+| Refresh TTL on hit (sliding expiration) | not yet — candidate optimization |
+| `VCACHE.INVALIDATE` vs. general `VDEL ... FILTER` | cache command for now, built on `Collection.DeleteWhere`, reusable for `VDEL ... FILTER` |
+| Stats persistence | in memory only, reset on restart |
+| Does a lookup count as an access? | only hits (`SearchOptions.NoTouch` + `Touch`) |
 
-```
-VCREATE answers DIM 1536 POLICY allkeys-lru MAX_VECTORS 100000
-        CACHE_THRESHOLD 0.92 CACHE_TTL 3600          # new, optional
+Optimization ideas (next, to validate against real RAG usage):
 
-VCACHE.GET answers (FP32 <blob> | VALUES <n> v...)
-           [THRESHOLD <s>] [FILTER <expr>] [WITHMETA]
-    → hit:  [id, score, text, (meta_json)]           # best match with score >= threshold
-    → miss: null
-
-VCACHE.SET answers <id> (FP32 <blob> | VALUES <n> v...) TEXT <answer>
-           [META <json>] [EX <sec> | PX <ms>]        # default TTL = CACHE_TTL
-
-VCACHE.STATS answers
-    → map: hits, misses, hit_rate, avg_hit_score, entries
-
-VCACHE.INVALIDATE answers FILTER <expr>             # e.g. model == "old-model"
-    → number of entries removed
-```
-
-- A hit counts as an access for LRU (same as `VGET`).
-- `FILTER` scopes the cache, e.g. `model == "gpt-x" and prompt_version == 3`, so answers
-  produced under another model or system prompt are never served.
-
-Open questions:
-
-- Default threshold when neither the command nor the collection sets one (or require it?).
-- Should a hit refresh the TTL (sliding expiration) — optional `TOUCH` flag?
-- Is `VCACHE.INVALIDATE` a cache-only command, or a general `VDEL ... FILTER`?
-- Stats persistence: in memory only, reset on restart?
+- Sliding expiration: optional `TOUCH` on hit to extend the TTL.
+- Per-entry hit counters (most asked questions; cache warming).
+- Stale-while-revalidate: serve an entry close to expiry and tell the client to refresh it.
+- Threshold tuning help: score distribution of hits and near-misses in `VCACHE.STATS`.
 
 ### 16.2 LangChain & LlamaIndex adapters
 

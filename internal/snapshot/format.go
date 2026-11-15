@@ -5,11 +5,15 @@
 //	magic "LWDB" | version uint16 | n_coll uint32
 //	repeat n_coll:
 //	  name str | dim uint32 | metric uint8 | index uint8 | max_vec uint32 | policy uint8
+//	  [v2+] has_cache_threshold uint8 | cache_threshold float64 | cache_ttl_sec int64
 //	  n_rec uint32
 //	  repeat n_rec: id str | vector dim×float32 | text str | meta str (JSON, "" = none) | expireAt int64
 //	crc32 uint32 (IEEE, over everything above)
 //
 //	str = uint32 length + bytes
+//
+// Version history: 1 = MVP; 2 = adds the semantic cache defaults per collection.
+// Readers accept every version up to the current one.
 package snapshot
 
 import (
@@ -29,7 +33,7 @@ import (
 
 const (
 	magic   = "LWDB"
-	version = 1
+	version = 2
 
 	// maxStrLen bounds strings read from a file, so a corrupt length cannot
 	// trigger a huge allocation (same bound as a RESP bulk string).
@@ -67,7 +71,8 @@ func (e *encoder) i64(v int64) {
 	binary.LittleEndian.PutUint64(e.buf[:8], uint64(v))
 	e.w.Write(e.buf[:8])
 }
-func (e *encoder) str(s string) { e.u32(uint32(len(s))); e.w.WriteString(s) }
+func (e *encoder) f64(v float64) { e.i64(int64(math.Float64bits(v))) }
+func (e *encoder) str(s string)  { e.u32(uint32(len(s))); e.w.WriteString(s) }
 func (e *encoder) bytes(b []byte) {
 	e.u32(uint32(len(b)))
 	e.w.Write(b)
@@ -103,6 +108,13 @@ func Write(w io.Writer, st *store.Store) (Stats, error) {
 				e.u8(code)
 				e.u32(uint32(h.Config.MaxVectors))
 				e.u8(uint8(h.Config.Policy))
+				if h.Config.HasCacheThreshold {
+					e.u8(1)
+				} else {
+					e.u8(0)
+				}
+				e.f64(h.Config.CacheThreshold)
+				e.i64(h.Config.CacheTTL)
 				e.u32(uint32(h.Count))
 				return nil
 			},
@@ -150,10 +162,11 @@ func (d *decoder) read(n int) []byte {
 	}
 	return d.buf[:n]
 }
-func (d *decoder) u8() uint8   { return d.read(1)[0] }
-func (d *decoder) u16() uint16 { return binary.LittleEndian.Uint16(d.read(2)) }
-func (d *decoder) u32() uint32 { return binary.LittleEndian.Uint32(d.read(4)) }
-func (d *decoder) i64() int64  { return int64(binary.LittleEndian.Uint64(d.read(8))) }
+func (d *decoder) u8() uint8    { return d.read(1)[0] }
+func (d *decoder) u16() uint16  { return binary.LittleEndian.Uint16(d.read(2)) }
+func (d *decoder) u32() uint32  { return binary.LittleEndian.Uint32(d.read(4)) }
+func (d *decoder) i64() int64   { return int64(binary.LittleEndian.Uint64(d.read(8))) }
+func (d *decoder) f64() float64 { return math.Float64frombits(uint64(d.i64())) }
 
 func (d *decoder) rawStr() []byte {
 	n := d.u32()
@@ -210,8 +223,9 @@ func Read(r io.Reader, st *store.Store) (Stats, error) {
 	if m := string(d.read(4)); d.err != nil || m != magic {
 		return stats, corrupt("not a Lawliet snapshot (bad magic)")
 	}
-	if v := d.u16(); d.err == nil && v != version {
-		return stats, corrupt("unsupported snapshot version %d (this build reads version %d)", v, version)
+	fileVersion := d.u16()
+	if d.err == nil && (fileVersion < 1 || fileVersion > version) {
+		return stats, corrupt("unsupported snapshot version %d (this build reads versions 1 to %d)", fileVersion, version)
 	}
 	nColl := d.u32()
 	for i := uint32(0); i < nColl && d.err == nil; i++ {
@@ -221,6 +235,14 @@ func Read(r io.Reader, st *store.Store) (Stats, error) {
 		indexCode := d.u8()
 		maxVec := int(d.u32())
 		policy := store.Policy(d.u8())
+		var hasThreshold bool
+		var threshold float64
+		var cacheTTL int64
+		if fileVersion >= 2 {
+			hasThreshold = d.u8() == 1
+			threshold = d.f64()
+			cacheTTL = d.i64()
+		}
 		nRec := d.u32()
 		if d.err != nil {
 			break
@@ -236,6 +258,7 @@ func Read(r io.Reader, st *store.Store) (Stats, error) {
 		}
 		col, err := st.Restore(name, store.Config{
 			Dim: dim, Metric: metric, Index: indexName, MaxVectors: maxVec, Policy: policy,
+			HasCacheThreshold: hasThreshold, CacheThreshold: threshold, CacheTTL: cacheTTL,
 		})
 		if err != nil {
 			return stats, corrupt("collection %q: %v", name, err)

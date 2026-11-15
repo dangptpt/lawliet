@@ -4,3 +4,4 @@
 *.test
 *.out
 .DS_Store
+!internal/snapshot/testdata/*.lwdb

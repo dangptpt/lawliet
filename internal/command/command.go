@@ -37,6 +37,7 @@ func Register(srv *server.Server, st *store.Store) {
 	srv.Register("vexpire", 4, h.vexpire)
 	srv.Register("vttl", 3, h.vttl)
 	srv.Register("vpersist", 3, h.vpersist)
+	registerVCache(srv, h)
 }
 
 // cmdError is an error whose text is sent to the client as is (with "ERR " prefix).
