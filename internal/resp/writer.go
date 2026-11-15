@@ -94,9 +94,15 @@ func (w *Writer) WriteMapHeader(n int) {
 	w.header('*', int64(2*n))
 }
 
-// WriteDouble writes a float. RESP3: ",<f>" (inf, -inf, nan allowed).
+// WriteDouble writes a float64. RESP3: ",<f>" (inf, -inf, nan allowed).
 // RESP2: bulk string with the same text.
-func (w *Writer) WriteDouble(f float64) {
+func (w *Writer) WriteDouble(f float64) { w.writeFloat(f, 64) }
+
+// WriteFloat32 writes a float32 using its shortest decimal form
+// (0.9 instead of 0.8999999761581421). Use it for vector scores.
+func (w *Writer) WriteFloat32(f float32) { w.writeFloat(float64(f), 32) }
+
+func (w *Writer) writeFloat(f float64, bitSize int) {
 	var s string
 	switch {
 	case math.IsInf(f, 1):
@@ -106,7 +112,7 @@ func (w *Writer) WriteDouble(f float64) {
 	case math.IsNaN(f):
 		s = "nan"
 	default:
-		s = strconv.FormatFloat(f, 'g', -1, 64)
+		s = strconv.FormatFloat(f, 'g', -1, bitSize)
 	}
 	if w.proto == 3 {
 		w.line(',', s)

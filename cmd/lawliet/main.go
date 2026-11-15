@@ -11,8 +11,10 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/tranbaohieu/lawliet/internal/command"
 	"github.com/tranbaohieu/lawliet/internal/config"
 	"github.com/tranbaohieu/lawliet/internal/server"
+	"github.com/tranbaohieu/lawliet/internal/store"
 	"github.com/tranbaohieu/lawliet/internal/version"
 )
 
@@ -39,6 +41,7 @@ func run(args []string) int {
 	defer stop()
 
 	srv := server.New(cfg.Addr(), logger)
+	command.Register(srv, store.New())
 	if err := srv.ListenAndServe(ctx); err != nil {
 		logger.Error("server error", "err", err)
 		return 1

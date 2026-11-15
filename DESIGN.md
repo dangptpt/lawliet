@@ -79,8 +79,10 @@ lawliet/
 │   ├── index/                 # Index interface, flat
 │   ├── vecmath/               # dot, l2, normalize
 │   ├── filter/                # lexer, parser, evaluator
-│   └── snapshot/              # .lwdb writer / reader
+│   ├── snapshot/              # .lwdb writer / reader
+│   └── server/servertest/     # test server + RESP client for integration tests
 ├── examples/python/           # RAG demo scripts
+├── scripts/e2e/               # end-to-end checks against a running server
 ├── DESIGN.md
 ├── README.md
 └── LICENSE
@@ -205,7 +207,9 @@ Two equivalent forms, accepted wherever a vector is expected:
 | `FP32 <blob>`                 | Code. `dim × 4` bytes, IEEE-754 float32, **little-endian** |
 | `VALUES <dim> v1 v2 ... vn`   | Manual testing with `redis-cli` |
 
-Blob length must equal `dim × 4`, otherwise `-ERR dimension mismatch`.
+Blob length must be a positive multiple of 4 (`-ERR invalid FP32 blob`) and equal `dim × 4`
+(`-ERR dimension mismatch`). Values must be finite (no NaN/Inf). With `cosine`, the zero vector
+is rejected because it cannot be normalized.
 
 Python client:
 
@@ -242,14 +246,15 @@ VCONFIG <col> SET POLICY <p>                                            → +OK
 VCONFIG <col> SET MAX_VECTORS <n>                                       → +OK
 ```
 
-`VINFO` fields: `dim, metric, index, count, max_vectors, policy, memory_bytes`.
+`VINFO` reply is a map (flat array in RESP2). Fields: `name, dim, metric, index, count, vector_bytes`;
+`max_vectors`, `policy` and `memory_bytes` are added in M4.
 
 ### 5.2 Records
 
 ```
 VADD <col> <id> (FP32 <blob> | VALUES <dim> v...)
      [TEXT <str>] [META <json>] [EX <sec> | PX <ms>] [NX | XX]   → :1 inserted | :0 updated | nil (NX/XX not met)
-VGET    <col> <id> [WITHVEC]       → [text, meta_json, (vector blob)] | nil
+VGET    <col> <id> [WITHVEC]       → [text, meta_json, (vector blob)] | nil   (text/meta are null until M2)
 VDEL    <col> <id> [<id> ...]      → :<deleted count>
 VEXISTS <col> <id>                 → :1 | :0
 VCOUNT  <col>                      → :<n>
@@ -273,7 +278,7 @@ VSEARCH <col> (FP32 <blob> | VALUES <dim> v...)
         [K <n>] [FILTER <expr>] [WITHTEXT] [WITHMETA] [WITHVEC]
 ```
 
-`K` defaults to 10. Reply: array of hits, best first. Each hit is an array:
+`K` defaults to 10, range 1–10000. Reply: array of hits, best first. Each hit is an array:
 
 ```
 [id, score, (text), (meta_json), (vector blob)]   # optional parts in flag order
@@ -506,6 +511,12 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | `-ERR collection already exists`                             | duplicate `VCREATE`           |
 | `-ERR max collections reached`                               | `max-collections` hit         |
 | `-ERR dimension mismatch: expected <d>, got <n>`             | wrong vector length           |
+| `-ERR invalid FP32 blob: length <n> is not a positive multiple of 4` | malformed blob        |
+| `-ERR VALUES <n> expects <n> numbers, got <m>`               | too few VALUES                |
+| `-ERR invalid number in VALUES: '<x>'`                       | non-numeric value             |
+| `-ERR zero vector is not allowed with cosine metric`         | zero vector, cosine           |
+| `-ERR vector contains NaN or Inf`                            | non-finite value              |
+| `-ERR K must be an integer between 1 and 10000`              | bad `K`                       |
 | `-ERR invalid metadata: <reason>`                            | bad META JSON                 |
 | `-ERR invalid filter: <reason>`                              | filter parse error            |
 | `-ERR max_vectors reached`                                   | limit hit with `noeviction`   |
@@ -522,7 +533,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | Milestone | Scope | Done when |
 |-----------|-------|-----------|
 | **M0** Skeleton ✅ | RESP2/RESP3 parser/writer, TCP server, courtesy commands | `redis-cli -p 6380 ping` → `PONG`; `redis-py` connects with default settings |
-| **M1** Core vectors | Collections, slab, `VADD/VGET/VDEL/VEXISTS/VCOUNT`, `VALUES`/`FP32`, Flat `VSEARCH` (no filter) | Python script inserts 10k vectors and gets correct top-K vs NumPy |
+| **M1** Core vectors ✅ | Collections, slab, `VADD/VGET/VDEL/VEXISTS/VCOUNT`, `VALUES`/`FP32`, Flat `VSEARCH` (no filter) | Python script inserts 10k vectors and gets correct top-K vs NumPy |
 | **M2** Metadata & filter | `TEXT`, `META`, filter lexer/parser/evaluator, `WITH*` flags | Filter unit tests incl. `and/or/not/()`, `in`, `contains` |
 | **M3** TTL | `EX/PX`, `VEXPIRE/VTTL/VPERSIST`, lazy + active expiry | Records disappear after TTL; `VTTL` matches Redis semantics |
 | **M4** Limits & eviction | MemTracker, `maxmemory`, `max_vectors`, 3 policies, `VCONFIG`, `VINFO`, `INFO` | Eviction tests per policy; `noeviction` returns errors |

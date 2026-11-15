@@ -72,3 +72,15 @@ func TestWriterDefaultProtoIs2(t *testing.T) {
 		t.Fatalf("default proto = %d, want 2", p)
 	}
 }
+
+func TestWriteFloat32ShortestForm(t *testing.T) {
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	w.WriteFloat32(0.9)
+	w.SetProto(3)
+	w.WriteFloat32(-0.25)
+	w.Flush()
+	if got, want := buf.String(), "$3\r\n0.9\r\n,-0.25\r\n"; got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
