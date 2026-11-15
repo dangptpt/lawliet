@@ -500,15 +500,22 @@ slots that have one.
 
 ## 10. Persistence (Snapshot)
 
-Disabled unless `--dir` is given.
+Disabled unless `--dir` is given. `--dir` must be an existing directory; `--dbfilename`
+(default `dump.lwdb`) must be a plain file name.
 
 ### 10.1 Triggers
 
 - Save rules: `--save "<seconds> <changes>"` (repeatable). Defaults when `--dir` is set:
-  `3600 1`, `300 100`, `60 10000`. `--save ""` disables auto-save.
-- `SAVE` command.
-- Graceful shutdown (`SIGINT`, `SIGTERM`).
-- Load on startup if the file exists.
+  `3600 1`, `300 100`, `60 10000`. `--save ""` disables auto-save. Rules are checked every
+  second; after a failed save the next attempt waits at least 5 s.
+- `SAVE` command (synchronous; one save at a time).
+- Graceful shutdown (`SIGINT`, `SIGTERM`): the server first stops accepting and closes all
+  connections, **then** saves, so no write can land after the final snapshot.
+- Load on startup if the file exists, before the server listens. Limits (`maxmemory`,
+  `max_vectors`, `max-collections`) are not enforced while loading, like Redis loading an RDB.
+  Records that expired while the server was down are skipped.
+- A file that fails to load (bad magic, version, checksum, truncation) stops the server with
+  exit code 1 and a log message; it is never partially loaded into a running server.
 
 `dirty` counter increments on every mutation; after a successful snapshot it is decreased
 by the value captured at snapshot start (mutations during the snapshot are kept).
@@ -517,6 +524,9 @@ by the value captured at snapshot start (mutations during the snapshot are kept)
 
 Collections are snapshotted one at a time, each under its **read lock**:
 reads continue, writes to that collection wait. (Go cannot safely `fork()` like Redis.)
+Each collection is consistent; the snapshot is not atomic across collections.
+
+Measured: 10 000 records × 384 dims with text and metadata → 15.4 MiB written in ~60 ms.
 
 ### 10.3 Safe write
 
@@ -553,7 +563,13 @@ str = uint32 length + bytes
 
 Tombstones and expired records are skipped (natural compaction).
 `lastAccess` is not persisted; set to load time.
+Vectors are written in their stored form and restored **bit-exact**: cosine vectors are not
+normalized again on load (re-normalizing changes the float bits of ~50% of vectors and thus
+the scores).
 Bad magic / version / CRC → refuse to start with a clear error.
+
+`INFO persistence`: `snapshot_enabled`, `snapshot_path`, `rdb_changes_since_last_save`,
+`rdb_last_save_time`, `rdb_last_save_status`, `rdb_last_save_duration_ms`.
 
 ---
 
@@ -606,6 +622,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | `-ERR max_vectors reached`                                   | limit hit, nothing evictable  |
 | `-OOM command not allowed when used memory > 'maxmemory'`    | memory limit, cannot evict    |
 | `-ERR snapshot disabled: start server with --dir`            | `SAVE` without `--dir`        |
+| `-ERR snapshot failed: <reason>`                             | `SAVE` could not write        |
 | `-NOPROTO unsupported protocol version`                      | `HELLO` with version other than 2/3 |
 
 ---
@@ -621,7 +638,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | **M2** Metadata & filter ✅ | `TEXT`, `META`, filter lexer/parser/evaluator, `WITH*` flags | Filter unit tests incl. `and/or/not/()`, `in`, `contains` |
 | **M3** TTL ✅ | `EX/PX`, `VEXPIRE/VTTL/VPERSIST`, lazy + active expiry | Records disappear after TTL; `VTTL` matches Redis semantics |
 | **M4** Limits & eviction ✅ | MemTracker, `maxmemory`, `max_vectors`, 3 policies, `VCONFIG`, `VINFO`, `INFO` | Eviction tests per policy; `noeviction` returns errors |
-| **M5** Snapshot | `.lwdb` writer/reader, save rules, `SAVE`, shutdown save, startup load | Restart restores identical search results; corrupt file detected |
+| **M5** Snapshot ✅ | `.lwdb` writer/reader, save rules, `SAVE`, shutdown save, startup load | Restart restores identical search results; corrupt file detected |
 | **M6** Release | README quickstart, Python RAG example, Dockerfile, GitHub Actions CI, benchmark script | `docker run` + example works end-to-end |
 
 ### Phase 2 (after MVP)

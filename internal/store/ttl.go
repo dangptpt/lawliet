@@ -108,6 +108,7 @@ func (c *Collection) Expire(id string, at int64) bool {
 		return true
 	}
 	c.setExpire(slot, at)
+	c.st.dirty.Add(1)
 	return true
 }
 
@@ -124,6 +125,7 @@ func (c *Collection) Persist(id string) bool {
 		return false
 	}
 	c.setExpire(slot, 0)
+	c.st.dirty.Add(1)
 	return true
 }
 

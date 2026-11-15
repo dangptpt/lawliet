@@ -237,6 +237,7 @@ func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error)
 		c.setExpire(slot, rec.ExpireAt)
 		c.touch(slot, now)
 		c.idx.Add(slot, v)
+		c.st.dirty.Add(1)
 		return Updated, nil
 	}
 	if mode == OnlyExisting {
@@ -269,11 +270,13 @@ func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error)
 	c.live++
 	c.addMem(newSize)
 	c.idx.Add(slot, v)
+	c.st.dirty.Add(1)
 	return Inserted, nil
 }
 
 // removeSlot deletes a record. Caller must hold c.mu for writing.
 func (c *Collection) removeSlot(id string, slot uint32) {
+	c.st.dirty.Add(1)
 	c.addMem(-c.slotBytes(slot))
 	c.idx.Remove(slot)
 	delete(c.idToSlot, id)

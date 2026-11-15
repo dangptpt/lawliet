@@ -124,6 +124,7 @@ func (c *Collection) SetPolicy(p Policy) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cfg.Policy = p
+	c.st.dirty.Add(1)
 }
 
 // SetMaxVectors changes the record limit (0 = unlimited). Lowering it below the
@@ -135,6 +136,7 @@ func (c *Collection) SetMaxVectors(n int) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.cfg.MaxVectors = n
+	c.st.dirty.Add(1)
 	return nil
 }
 

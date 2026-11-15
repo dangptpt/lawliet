@@ -72,3 +72,33 @@ func TestParseMemoryFlags(t *testing.T) {
 		t.Error("bad --maxmemory should fail")
 	}
 }
+
+func TestPersistenceFlags(t *testing.T) {
+	c, err := Parse(nil, io.Discard)
+	if err != nil || c.SnapshotPath() != "" || c.SaveRules != nil {
+		t.Fatalf("default: persistence must be off: %+v %v", c, err)
+	}
+
+	dir := t.TempDir()
+	c, err = Parse([]string{"--dir", dir, "--save", "60 10", "--save", "300 1"}, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SnapshotPath() != dir+"/dump.lwdb" || len(c.SaveRules) != 2 || c.SaveRules[0] != "60 10" {
+		t.Fatalf("%+v", c)
+	}
+	c, _ = Parse([]string{"--dir", dir, "--save", ""}, io.Discard)
+	if len(c.SaveRules) != 1 || c.SaveRules[0] != "" {
+		t.Fatalf("empty --save must be kept to disable rules: %+v", c.SaveRules)
+	}
+
+	for _, args := range [][]string{
+		{"--dir", dir + "/missing"},
+		{"--dir", dir, "--dbfilename", "a/b.lwdb"},
+		{"--dir", dir, "--dbfilename", ""},
+	} {
+		if _, err := Parse(args, io.Discard); err == nil {
+			t.Errorf("Parse(%q) should fail", args)
+		}
+	}
+}

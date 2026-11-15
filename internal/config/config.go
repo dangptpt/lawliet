@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -18,7 +20,33 @@ type Config struct {
 	MaxMemoryRaw   string // as given, e.g. "2gb"
 	MaxMemoryPol   string // default eviction policy for new collections
 	MaxCollections int    // 0 = unlimited
+	Dir            string // snapshot directory; empty = persistence off
+	DBFilename     string
+	SaveRules      []string // raw --save values; nil = not given (use defaults)
 	ShowVersion    bool
+}
+
+// SnapshotPath returns the snapshot file path, or "" if persistence is off.
+func (c Config) SnapshotPath() string {
+	if c.Dir == "" {
+		return ""
+	}
+	return filepath.Join(c.Dir, c.DBFilename)
+}
+
+// stringList is a repeatable string flag.
+type stringList struct{ vals *[]string }
+
+func (s stringList) String() string {
+	if s.vals == nil {
+		return ""
+	}
+	return strings.Join(*s.vals, ", ")
+}
+
+func (s stringList) Set(v string) error {
+	*s.vals = append(*s.vals, v)
+	return nil
 }
 
 // Addr returns the listen address "bind:port".
@@ -35,6 +63,10 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	fs.StringVar(&c.MaxMemoryPol, "maxmemory-policy", "noeviction",
 		"default eviction policy for new collections: noeviction, allkeys-lru, volatile-ttl")
 	fs.IntVar(&c.MaxCollections, "max-collections", 0, "maximum number of collections (0 = unlimited)")
+	fs.StringVar(&c.Dir, "dir", "", "snapshot directory (empty = in-memory only, no persistence)")
+	fs.StringVar(&c.DBFilename, "dbfilename", "dump.lwdb", "snapshot file name inside --dir")
+	fs.Var(stringList{&c.SaveRules}, "save",
+		`snapshot rule "<seconds> <changes>", repeatable; "" disables automatic snapshots (default "3600 1", "300 100", "60 10000")`)
 	fs.BoolVar(&c.ShowVersion, "version", false, "print version and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -53,6 +85,15 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	c.MaxMemory = n
 	if c.MaxCollections < 0 {
 		return Config{}, fmt.Errorf("invalid --max-collections %d: must be >= 0", c.MaxCollections)
+	}
+	if c.Dir != "" {
+		fi, err := os.Stat(c.Dir)
+		if err != nil || !fi.IsDir() {
+			return Config{}, fmt.Errorf("invalid --dir %q: not an existing directory", c.Dir)
+		}
+		if c.DBFilename == "" || strings.ContainsRune(c.DBFilename, filepath.Separator) {
+			return Config{}, fmt.Errorf("invalid --dbfilename %q: must be a plain file name", c.DBFilename)
+		}
 	}
 	return c, nil
 }

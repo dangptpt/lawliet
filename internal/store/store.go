@@ -3,6 +3,7 @@ package store
 
 import (
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,7 @@ type Store struct {
 	limits  atomic.Pointer[Limits]
 	used    atomic.Int64 // estimated bytes of all records
 	evicted atomic.Int64 // records removed by eviction
+	dirty   atomic.Int64 // mutations since the last snapshot (DESIGN.md §10.1)
 }
 
 // New returns an empty store using the system clock and no limits.
@@ -63,8 +65,32 @@ func (s *Store) SetClock(now func() int64) { s.now = now }
 // Now returns the store clock in unix ms.
 func (s *Store) Now() int64 { return s.now() }
 
+// Dirty returns the number of mutations since the last successful snapshot.
+func (s *Store) Dirty() int64 { return s.dirty.Load() }
+
+// ConsumeDirty subtracts n mutations (the value read when a snapshot started),
+// keeping the ones that happened while it was written.
+func (s *Store) ConsumeDirty(n int64) { s.dirty.Add(-n) }
+
+// Collections returns all collections sorted by name.
+func (s *Store) Collections() []*Collection {
+	cols := s.collectionList()
+	slices.SortFunc(cols, func(a, b *Collection) int { return strings.Compare(a.name, b.name) })
+	return cols
+}
+
 // Create adds a new collection.
 func (s *Store) Create(name string, cfg Config) (*Collection, error) {
+	return s.create(name, cfg, true)
+}
+
+// Restore creates a collection while loading a snapshot: limits such as
+// max-collections are not enforced (same as Redis loading an RDB file).
+func (s *Store) Restore(name string, cfg Config) (*Collection, error) {
+	return s.create(name, cfg, false)
+}
+
+func (s *Store) create(name string, cfg Config, enforceLimits bool) (*Collection, error) {
 	if name == "" {
 		return nil, &ConfigError{Msg: "collection name must not be empty"}
 	}
@@ -76,11 +102,12 @@ func (s *Store) Create(name string, cfg Config) (*Collection, error) {
 	if _, ok := s.collections[name]; ok {
 		return nil, ErrCollectionExists
 	}
-	if max := s.Limits().MaxCollections; max > 0 && len(s.collections) >= max {
+	if max := s.Limits().MaxCollections; enforceLimits && max > 0 && len(s.collections) >= max {
 		return nil, ErrMaxCollections
 	}
 	c := newCollection(name, cfg, s)
 	s.collections[name] = c
+	s.dirty.Add(1)
 	return c, nil
 }
 
@@ -106,6 +133,7 @@ func (s *Store) Drop(name string) bool {
 		return false
 	}
 	delete(s.collections, name)
+	s.dirty.Add(1)
 	c.mu.Lock()
 	s.used.Add(-c.memBytes)
 	c.memBytes = 0

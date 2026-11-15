@@ -345,3 +345,28 @@ func TestSearchWithFilterAndFields(t *testing.T) {
 		t.Fatalf("want no results, got %+v", res)
 	}
 }
+
+func TestRestoreKeepsVectorBits(t *testing.T) {
+	s := New()
+	src := mustCreate(t, s, "src", 3, index.Cosine)
+	src.Add("a", Record{Vector: []float32{0.3, -1.7, 2.9}}, Upsert)
+	stored, _ := src.Get("a")
+
+	dst := mustCreate(t, s, "dst", 3, index.Cosine)
+	if ok, err := dst.Restore("a", Record{Vector: stored.Vector}); !ok || err != nil {
+		t.Fatalf("Restore: %v %v", ok, err)
+	}
+	got, _ := dst.Get("a")
+	for i := range got.Vector {
+		if math.Float32bits(got.Vector[i]) != math.Float32bits(stored.Vector[i]) {
+			t.Fatalf("vector changed at %d: %v vs %v", i, got.Vector, stored.Vector)
+		}
+	}
+	if _, err := dst.Restore("a", Record{Vector: stored.Vector}); !errors.Is(err, ErrDuplicateID) {
+		t.Fatalf("duplicate: %v", err)
+	}
+	var dm *DimMismatchError
+	if _, err := dst.Restore("b", Record{Vector: []float32{1}}); !errors.As(err, &dm) {
+		t.Fatalf("dim: %v", err)
+	}
+}
