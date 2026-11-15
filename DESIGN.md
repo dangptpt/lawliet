@@ -1,0 +1,532 @@
+# Lawliet — Design Document
+
+> In-memory vector embedding cache, speaking the Redis protocol (RESP).
+> Status: **Draft v0** · License: **Apache-2.0** · Language: **Go**
+
+---
+
+## 1. Overview
+
+Lawliet is a lightweight, single-binary, in-memory vector database designed for
+**fast testing, prototyping and demoing RAG / LLM applications**.
+
+Heavy vector databases (e.g. Milvus) need object storage, segment management,
+lazy loading, etc. Lawliet takes the opposite approach: keep everything in RAM,
+speak RESP so any existing Redis client works, and start with one command.
+
+```bash
+lawliet --port 6380
+```
+
+```python
+import redis
+r = redis.Redis(port=6380)
+r.execute_command("VCREATE", "docs", "DIM", 1536, "METRIC", "cosine")
+```
+
+### 1.1 Goals
+
+- Zero-config, single binary, starts in milliseconds.
+- RESP2 wire compatibility: usable from `redis-cli`, `redis-py`, `ioredis`, `go-redis`, ... via raw commands.
+- Exact (Flat) vector search with metadata filtering.
+- Cache-oriented features: per-record TTL, memory limits, per-collection eviction policies.
+- Optional snapshot persistence to a single local file.
+
+### 1.2 Non-goals (MVP)
+
+- Distributed mode, replication, clustering.
+- Datasets larger than RAM.
+- Object storage, segments, WAL/AOF.
+- Authentication / TLS (bind to `127.0.0.1` by default).
+- RESP3, HTTP/REST API (planned later).
+
+---
+
+## 2. Architecture
+
+```
+┌──────────────────────────────────────────────┐
+│ TCP listener (net)  — 1 goroutine / conn     │
+├──────────────────────────────────────────────┤
+│ RESP2 reader / writer                        │
+├──────────────────────────────────────────────┤
+│ Command dispatcher  (V*, SAVE, courtesy cmds)│
+├──────────────────────────────────────────────┤
+│ Store                                        │
+│  ├─ Collection (RWMutex each)                │
+│  │   ├─ VectorSlab (chunked []float32)       │
+│  │   ├─ ID map, text, metadata, TTL, LRU     │
+│  │   └─ Index (interface) → FlatIndex        │
+│  ├─ MemTracker (estimated bytes)             │
+│  └─ Evictor / Expirer                        │
+├──────────────────────────────────────────────┤
+│ Snapshotter (optional, --dir)                │
+└──────────────────────────────────────────────┘
+```
+
+### 2.1 Repository layout
+
+```
+lawliet/
+├── cmd/lawliet/main.go        # flags, wiring, signal handling
+├── internal/
+│   ├── config/                # flag parsing, size parsing ("2gb")
+│   ├── resp/                  # RESP2 parser + writer
+│   ├── server/                # TCP server, connection loop, dispatch
+│   ├── command/               # one file per command group
+│   ├── store/                 # Store, Collection, slab, memtracker, eviction, ttl
+│   ├── index/                 # Index interface, flat
+│   ├── vecmath/               # dot, l2, normalize
+│   ├── filter/                # lexer, parser, evaluator
+│   └── snapshot/              # .lwdb writer / reader
+├── examples/python/           # RAG demo scripts
+├── DESIGN.md
+├── README.md
+└── LICENSE
+```
+
+---
+
+## 3. Data Model
+
+```
+Server
+ └── Collection  (name, dim, metric, index, max_vectors, policy)
+      └── Record
+           ├── ID        string, user-defined, upsert on duplicate
+           ├── Vector    []float32 of length dim
+           ├── Text      string (optional, RAG chunk content)
+           ├── Metadata  flat typed key/value (optional)
+           └── ExpireAt  unix ms, 0 = no TTL
+```
+
+No Redis-style numbered databases. `SELECT 0` returns `OK`; other indexes return an error.
+
+### 3.1 Collection config
+
+| Field         | Values                                       | Mutable |
+|---------------|----------------------------------------------|---------|
+| `name`        | string, unique                               | no      |
+| `dim`         | int > 0                                      | no      |
+| `metric`      | `cosine` (default) \| `l2` \| `ip`           | no      |
+| `index`       | `flat` (MVP)                                 | no (MVP)|
+| `max_vectors` | int, 0 = unlimited                           | yes     |
+| `policy`      | `noeviction` \| `allkeys-lru` \| `volatile-ttl` (default from server flag) | yes |
+
+Lowering `max_vectors` below the current count **only blocks new inserts**; existing records are kept.
+
+### 3.2 IDs and slots
+
+- External ID: string chosen by the user (e.g. `doc:42`).
+- Internal slot: `uint32`, index into the vector slab and parallel arrays.
+- Deleted slots become tombstones and are pushed to a free list for reuse.
+
+### 3.3 Vector storage
+
+- Vectors are stored in a **chunked slab**: `[][]float32`, each chunk holds `chunkSize` (1024) vectors.
+- Chunks contain no pointers → the Go GC does not scan their contents.
+- Growth allocates a new chunk; existing data is never copied.
+- For `cosine`, vectors are **L2-normalized on insert**. Returned vectors (`WITHVEC`) are the normalized ones.
+
+### 3.4 Metadata
+
+Passed as a **flat JSON object**. Types are inferred:
+
+| JSON type          | Internal kind | Filter ops                      |
+|--------------------|---------------|---------------------------------|
+| string             | string        | `== != in`                      |
+| integer number     | int64         | `== != < <= > >=`               |
+| non-integer number | float64       | `== != < <= > >=`               |
+| bool               | bool          | `== !=`                         |
+| array of strings   | []string      | `contains`                      |
+
+Nested objects, `null`, and arrays of non-strings are rejected with `-ERR invalid metadata`.
+
+### 3.5 Go structures (sketch)
+
+```go
+type Collection struct {
+    mu  sync.RWMutex
+    cfg CollectionConfig
+
+    vectors    VectorSlab
+    idToSlot   map[string]uint32
+    slotToID   []string
+    texts      []string
+    meta       []map[string]Value
+    expireAt   []int64
+    lastAccess []atomic.Int64
+    deleted    []bool
+    freeList   []uint32
+    ttlSlots   map[uint32]struct{} // slots having a TTL, for active expiry / volatile-ttl
+    liveCount  int
+
+    index Index
+}
+
+type Index interface {
+    Add(slot uint32, vec []float32)
+    Remove(slot uint32)
+    Search(q []float32, k int, accept func(slot uint32) bool) []Hit
+}
+```
+
+---
+
+## 4. Wire Format
+
+### 4.1 Protocol
+
+RESP2 only. `HELLO 3` → `-NOPROTO`. Clients should fall back to RESP2.
+
+### 4.2 Vector encoding
+
+Two equivalent forms, accepted wherever a vector is expected:
+
+| Form                          | Use                    |
+|-------------------------------|------------------------|
+| `FP32 <blob>`                 | Code. `dim × 4` bytes, IEEE-754 float32, **little-endian** |
+| `VALUES <dim> v1 v2 ... vn`   | Manual testing with `redis-cli` |
+
+Blob length must equal `dim × 4`, otherwise `-ERR dimension mismatch`.
+
+Python client:
+
+```python
+blob = emb.astype("<f4").tobytes()   # float32, little-endian
+```
+
+### 4.3 Scores
+
+Always **similarity, higher is better**:
+
+| Metric   | Score returned            |
+|----------|---------------------------|
+| `cosine` | cosine similarity [-1, 1] |
+| `ip`     | dot product               |
+| `l2`     | `-euclidean_distance`     |
+
+Scores are returned as bulk strings (RESP2 has no double type).
+
+---
+
+## 5. Commands
+
+### 5.1 Collections
+
+```
+VCREATE <col> DIM <n> [METRIC cosine|l2|ip] [INDEX flat]
+        [MAX_VECTORS <n>] [POLICY noeviction|allkeys-lru|volatile-ttl]   → +OK
+VDROP   <col>                                                           → :1 | :0
+VLIST                                                                   → array of names
+VINFO   <col>                                                           → flat key/value array
+VCONFIG <col> GET                                                       → flat key/value array
+VCONFIG <col> SET POLICY <p>                                            → +OK
+VCONFIG <col> SET MAX_VECTORS <n>                                       → +OK
+```
+
+`VINFO` fields: `dim, metric, index, count, max_vectors, policy, memory_bytes`.
+
+### 5.2 Records
+
+```
+VADD <col> <id> (FP32 <blob> | VALUES <dim> v...)
+     [TEXT <str>] [META <json>] [EX <sec> | PX <ms>] [NX | XX]   → :1 inserted | :0 updated | nil (NX/XX not met)
+VGET    <col> <id> [WITHVEC]       → [text, meta_json, (vector blob)] | nil
+VDEL    <col> <id> [<id> ...]      → :<deleted count>
+VEXISTS <col> <id>                 → :1 | :0
+VCOUNT  <col>                      → :<n>
+```
+
+- No flag: upsert. `NX`: only insert if absent. `XX`: only update if present.
+- Upsert without `EX/PX` **removes** an existing TTL (same as Redis `SET`).
+
+### 5.3 TTL
+
+```
+VEXPIRE  <col> <id> <sec>   → :1 | :0
+VTTL     <col> <id>         → seconds | -1 (no TTL) | -2 (not found)
+VPERSIST <col> <id>         → :1 | :0
+```
+
+### 5.4 Search
+
+```
+VSEARCH <col> (FP32 <blob> | VALUES <dim> v...)
+        [K <n>] [FILTER <expr>] [WITHTEXT] [WITHMETA] [WITHVEC]
+```
+
+`K` defaults to 10. Reply: array of hits, best first. Each hit is an array:
+
+```
+[id, score, (text), (meta_json), (vector blob)]   # optional parts in flag order
+```
+
+Records returned in the top-K have their `lastAccess` updated.
+
+### 5.5 Persistence
+
+```
+SAVE   → +OK | -ERR snapshot disabled: start server with --dir
+```
+
+Synchronous. Serialized with automatic snapshots via a mutex.
+
+### 5.6 Courtesy commands (client compatibility)
+
+| Command                           | Behavior                               |
+|-----------------------------------|----------------------------------------|
+| `PING [msg]`                      | `+PONG` or echo                        |
+| `ECHO msg`                        | echo                                   |
+| `HELLO [2]`                       | server info; `HELLO 3` → `-NOPROTO`     |
+| `SELECT 0`                        | `+OK`; other → error                   |
+| `CLIENT SETNAME/SETINFO/GETNAME`  | `+OK` / name                           |
+| `COMMAND`, `COMMAND DOCS`         | empty array                            |
+| `INFO [section]`                  | `server`, `memory`, `stats`, `persistence` |
+| `QUIT`                            | `+OK`, close connection                |
+
+---
+
+## 6. Filter Language
+
+### 6.1 Grammar (EBNF)
+
+```
+expr       = or_expr ;
+or_expr    = and_expr { "or" and_expr } ;
+and_expr   = not_expr { "and" not_expr } ;
+not_expr   = [ "not" ] primary ;
+primary    = "(" expr ")" | comparison ;
+comparison = IDENT op literal
+           | IDENT "in" "[" literal { "," literal } "]"
+           | IDENT "contains" STRING ;
+op         = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
+literal    = STRING | NUMBER | "true" | "false" ;
+STRING     = '"' { char } '"' ;
+```
+
+Keywords are case-insensitive. Precedence: `not` > `and` > `or`.
+
+### 6.2 Semantics
+
+- Missing field → comparison is `false` (so `not field == x` is `true`).
+- Type mismatch (e.g. `page == "3"` when `page` is int) → `false`, not an error.
+- int and float compare numerically.
+- Parsed once per `VSEARCH`, evaluated per record (brute force) **before** distance computation.
+
+Example:
+
+```
+(source == "hr.md" or source in ["it.md", "ops.md"]) and page >= 2 and not tags contains "draft"
+```
+
+---
+
+## 7. Search (Flat Index)
+
+- Iterate all live, non-expired slots; apply filter; compute score.
+- Keep top-K with a **min-heap of size K**.
+- Cosine on normalized vectors = dot product.
+- Later optimization: split slab across goroutines, merge per-worker heaps; loop unrolling / SIMD.
+
+---
+
+## 8. Memory Limits & Eviction
+
+### 8.1 Limits
+
+| Limit            | Scope      | Flag / option               |
+|------------------|------------|-----------------------------|
+| `maxmemory`      | server     | `--maxmemory 2gb` (0 = off) |
+| `max-collections`| server     | `--max-collections <n>`     |
+| `max_vectors`    | collection | `VCREATE ... MAX_VECTORS n` |
+
+### 8.2 Memory accounting
+
+Memory is **estimated**, not measured: each insert/delete adds/subtracts
+
+```
+dim*4 + len(id)*2 + len(text) + Σ(meta key+value sizes) + ~64B overhead
+```
+
+Upsert reserves only the delta. `INFO memory` reports both `used_memory_estimated`
+and `used_memory_runtime` (from `runtime/metrics`) so users can see the drift.
+
+### 8.3 Policies (per collection)
+
+| Policy          | Victim                                   |
+|-----------------|------------------------------------------|
+| `noeviction`    | none → error                             |
+| `allkeys-lru`   | lowest `lastAccess` among N random samples |
+| `volatile-ttl`  | lowest `expireAt` among N random samples with TTL |
+
+`N = 5`. Approximate (sampling) by design, similar to Redis.
+
+"Access" = `VADD`, `VGET`, or being returned in `VSEARCH` top-K.
+
+### 8.4 Flow on insert of a new record
+
+```
+VADD
+ 1. Store.freeMemory(need)          (no collection lock held)
+      while over maxmemory:
+        pick a random collection whose policy != noeviction
+        sample, evict worst
+        none available → -OOM
+ 2. lock collection
+ 3. if liveCount >= max_vectors:
+        policy == noeviction → -ERR max_vectors reached
+        else sample within this collection, evict worst
+ 4. insert, unlock
+```
+
+Never call `freeMemory` while holding a collection lock (deadlock risk).
+
+---
+
+## 9. TTL Expiry
+
+- **Lazy**: any read/search touching an expired record skips it and deletes it.
+- **Active**: every 100 ms, for each collection with TTL records, sample up to 20 slots
+  from `ttlSlots`, delete expired ones; repeat while > 25% of the sample was expired
+  (bounded time budget per tick).
+
+---
+
+## 10. Persistence (Snapshot)
+
+Disabled unless `--dir` is given.
+
+### 10.1 Triggers
+
+- Save rules: `--save "<seconds> <changes>"` (repeatable). Defaults when `--dir` is set:
+  `3600 1`, `300 100`, `60 10000`. `--save ""` disables auto-save.
+- `SAVE` command.
+- Graceful shutdown (`SIGINT`, `SIGTERM`).
+- Load on startup if the file exists.
+
+`dirty` counter increments on every mutation; after a successful snapshot it is decreased
+by the value captured at snapshot start (mutations during the snapshot are kept).
+
+### 10.2 Consistency
+
+Collections are snapshotted one at a time, each under its **read lock**:
+reads continue, writes to that collection wait. (Go cannot safely `fork()` like Redis.)
+
+### 10.3 Safe write
+
+```
+write  <dir>/dump.lwdb.tmp
+fsync
+rename dump.lwdb.tmp → dump.lwdb   (atomic on POSIX, same filesystem)
+```
+
+### 10.4 File format `.lwdb` (little-endian)
+
+```
+magic        "LWDB"           4B
+version      uint16
+n_coll       uint32
+repeat n_coll:
+  name       str
+  dim        uint32
+  metric     uint8
+  index      uint8
+  max_vec    uint32
+  policy     uint8
+  n_rec      uint32
+  repeat n_rec:
+    id       str
+    vector   dim × float32
+    text     str
+    meta     str (JSON)
+    expireAt int64
+crc32        uint32 (IEEE, over everything above)
+
+str = uint32 length + bytes
+```
+
+Tombstones and expired records are skipped (natural compaction).
+`lastAccess` is not persisted; set to load time.
+Bad magic / version / CRC → refuse to start with a clear error.
+
+---
+
+## 11. Concurrency
+
+- One goroutine per connection.
+- `Store.mu` (RWMutex) guards the collection map.
+- `Collection.mu` (RWMutex): `VSEARCH`/`VGET` take read lock; mutations take write lock.
+- `lastAccess` uses atomics so readers can update it under the read lock.
+- `MemTracker` uses atomic CAS.
+- Lock order: `Store.mu` → `Collection.mu`. Never hold two collection locks at once.
+
+---
+
+## 12. Server Flags
+
+| Flag                  | Default        |
+|-----------------------|----------------|
+| `--bind`              | `127.0.0.1`    |
+| `--port`              | `6380`         |
+| `--maxmemory`         | `0` (unlimited)|
+| `--maxmemory-policy`  | `noeviction` (default for new collections) |
+| `--max-collections`   | `0` (unlimited)|
+| `--dir`               | empty → persistence off |
+| `--dbfilename`        | `dump.lwdb`    |
+| `--save`              | see §10.1      |
+
+---
+
+## 13. Errors
+
+| Error                                                        | When                          |
+|--------------------------------------------------------------|-------------------------------|
+| `-ERR unknown command '<cmd>'`                               | unknown command               |
+| `-ERR wrong number of arguments for '<cmd>' command`         | arity                         |
+| `-ERR syntax error`                                          | bad option                    |
+| `-ERR collection not found`                                  | missing collection            |
+| `-ERR collection already exists`                             | duplicate `VCREATE`           |
+| `-ERR max collections reached`                               | `max-collections` hit         |
+| `-ERR dimension mismatch: expected <d>, got <n>`             | wrong vector length           |
+| `-ERR invalid metadata: <reason>`                            | bad META JSON                 |
+| `-ERR invalid filter: <reason>`                              | filter parse error            |
+| `-ERR max_vectors reached`                                   | limit hit with `noeviction`   |
+| `-OOM command not allowed when used memory > 'maxmemory'`    | memory limit, cannot evict    |
+| `-ERR snapshot disabled: start server with --dir`            | `SAVE` without `--dir`        |
+| `-NOPROTO unsupported protocol version`                      | `HELLO 3`                     |
+
+---
+
+## 14. Roadmap
+
+### MVP
+
+| Milestone | Scope | Done when |
+|-----------|-------|-----------|
+| **M0** Skeleton | RESP2 parser/writer, TCP server, courtesy commands | `redis-cli -p 6380 ping` → `PONG`; `redis-py` connects |
+| **M1** Core vectors | Collections, slab, `VADD/VGET/VDEL/VEXISTS/VCOUNT`, `VALUES`/`FP32`, Flat `VSEARCH` (no filter) | Python script inserts 10k vectors and gets correct top-K vs NumPy |
+| **M2** Metadata & filter | `TEXT`, `META`, filter lexer/parser/evaluator, `WITH*` flags | Filter unit tests incl. `and/or/not/()`, `in`, `contains` |
+| **M3** TTL | `EX/PX`, `VEXPIRE/VTTL/VPERSIST`, lazy + active expiry | Records disappear after TTL; `VTTL` matches Redis semantics |
+| **M4** Limits & eviction | MemTracker, `maxmemory`, `max_vectors`, 3 policies, `VCONFIG`, `VINFO`, `INFO` | Eviction tests per policy; `noeviction` returns errors |
+| **M5** Snapshot | `.lwdb` writer/reader, save rules, `SAVE`, shutdown save, startup load | Restart restores identical search results; corrupt file detected |
+| **M6** Release | README quickstart, Python RAG example, Dockerfile, GitHub Actions CI, benchmark script | `docker run` + example works end-to-end |
+
+### Phase 2 (after MVP)
+
+- HNSW index (behind `Index` interface)
+- RESP3, HTTP/REST API
+- Batch insert command
+- Metadata secondary index for faster filtering
+- Quantization (int8 / binary), float16
+- Parallel Flat search, SIMD distance
+- AUTH / TLS
+- LangChain & LlamaIndex adapters
+- Chunked/incremental snapshot to reduce write blocking
+
+---
+
+## 15. Project Info
+
+- Go module path: `github.com/tranbaohieu/lawliet`
+- Default port: `6380`
