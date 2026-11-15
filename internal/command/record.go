@@ -1,14 +1,16 @@
 package command
 
 import (
+	"github.com/tranbaohieu/lawliet/internal/meta"
 	"github.com/tranbaohieu/lawliet/internal/server"
 	"github.com/tranbaohieu/lawliet/internal/store"
 )
 
-// VADD <col> <id> (FP32 <blob> | VALUES <n> v...) [NX | XX]
+// VADD <col> <id> (FP32 <blob> | VALUES <n> v...) [TEXT <str>] [META <json>] [NX | XX]
 //
 // Reply: 1 inserted, 0 updated, null if the NX/XX condition was not met.
-// TEXT/META (M2) and EX/PX (M3) are not supported yet.
+// An update replaces the whole record (text/meta not given are cleared).
+// EX/PX (M3) are not supported yet.
 func (h *handlers) vadd(c *server.Conn, args [][]byte) {
 	col, err := h.st.Get(string(args[1]))
 	if err != nil {
@@ -20,9 +22,19 @@ func (h *handlers) vadd(c *server.Conn, args [][]byte) {
 		writeErr(c, err)
 		return
 	}
+	rec := store.Record{Vector: vec}
 	mode := store.Upsert
 	for ; i < len(args); i++ {
 		switch {
+		case isKeyword(args[i], "TEXT") && i+1 < len(args):
+			rec.Text = string(args[i+1])
+			i++
+		case isKeyword(args[i], "META") && i+1 < len(args):
+			if rec.Meta, err = meta.ParseJSON(args[i+1]); err != nil {
+				writeErr(c, err)
+				return
+			}
+			i++
 		case isKeyword(args[i], "NX") && mode != store.OnlyExisting:
 			mode = store.OnlyNew
 		case isKeyword(args[i], "XX") && mode != store.OnlyNew:
@@ -33,7 +45,7 @@ func (h *handlers) vadd(c *server.Conn, args [][]byte) {
 		}
 	}
 
-	res, err := col.Add(string(args[2]), vec, mode)
+	res, err := col.Add(string(args[2]), rec, mode)
 	if err != nil {
 		writeErr(c, err)
 		return
@@ -50,8 +62,8 @@ func (h *handlers) vadd(c *server.Conn, args [][]byte) {
 
 // VGET <col> <id> [WITHVEC]
 //
-// Reply: [text, meta_json, (vector)] or null. Text and metadata arrive in M2
-// and are null until then.
+// Reply: [text, meta_json, (vector)] or null if the record does not exist.
+// Missing text / metadata are null.
 func (h *handlers) vget(c *server.Conn, args [][]byte) {
 	withVec := false
 	switch {
@@ -66,7 +78,7 @@ func (h *handlers) vget(c *server.Conn, args [][]byte) {
 		writeErr(c, err)
 		return
 	}
-	vec, ok := col.Get(string(args[2]))
+	rec, ok := col.Get(string(args[2]))
 	if !ok {
 		c.W().WriteNull()
 		return
@@ -77,11 +89,29 @@ func (h *handlers) vget(c *server.Conn, args [][]byte) {
 	} else {
 		w.WriteArrayHeader(2)
 	}
-	w.WriteNull() // text (M2)
-	w.WriteNull() // meta (M2)
+	writeText(c, rec.Text)
+	writeMeta(c, rec.Meta)
 	if withVec {
-		w.WriteBulk(encodeFP32(vec))
+		w.WriteBulk(encodeFP32(rec.Vector))
 	}
+}
+
+// writeText writes the record text, or null if empty.
+func writeText(c *server.Conn, s string) {
+	if s == "" {
+		c.W().WriteNull()
+		return
+	}
+	c.W().WriteBulkString(s)
+}
+
+// writeMeta writes metadata as a JSON object string, or null if none.
+func writeMeta(c *server.Conn, m meta.Map) {
+	if len(m) == 0 {
+		c.W().WriteNull()
+		return
+	}
+	c.W().WriteBulk(m.JSON())
 }
 
 // VDEL <col> <id> [<id> ...]

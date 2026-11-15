@@ -143,7 +143,15 @@ Passed as a **flat JSON object**. Types are inferred:
 | bool               | bool          | `== !=`                         |
 | array of strings   | []string      | `contains`                      |
 
-Nested objects, `null`, and arrays of non-strings are rejected with `-ERR invalid metadata`.
+Nested objects, `null`, arrays of non-strings and empty field names are rejected with
+`-ERR invalid metadata`. Integers that do not fit in int64 become float64.
+An empty object `{}` is stored as "no metadata".
+
+Metadata is returned as a JSON object string with **sorted keys**. Floats always keep a
+decimal point or exponent (`3.0`, not `3`), so they parse back as float.
+
+A stored metadata map is immutable: an update replaces the whole map, so readers can share it
+without copying.
 
 ### 3.5 Go structures (sketch)
 
@@ -261,7 +269,9 @@ VCOUNT  <col>                      → :<n>
 ```
 
 - No flag: upsert. `NX`: only insert if absent. `XX`: only update if present.
-- Upsert without `EX/PX` **removes** an existing TTL (same as Redis `SET`).
+- An update **replaces the whole record**: `TEXT`/`META` not given are cleared, and an update
+  without `EX/PX` removes an existing TTL (same as Redis `SET`).
+- In `VGET`/`VSEARCH` replies, empty text and missing metadata are null.
 
 ### 5.3 TTL
 
@@ -281,8 +291,12 @@ VSEARCH <col> (FP32 <blob> | VALUES <dim> v...)
 `K` defaults to 10, range 1–10000. Reply: array of hits, best first. Each hit is an array:
 
 ```
-[id, score, (text), (meta_json), (vector blob)]   # optional parts in flag order
+[id, score, (text), (meta_json), (vector blob)]
 ```
+
+Optional parts always appear in this fixed order, whatever the order of the flags.
+`FILTER` is applied **before** ranking: the reply holds the best K records among those
+matching the filter (fewer if fewer match).
 
 Records returned in the top-K have their `lastAccess` updated.
 
@@ -327,13 +341,29 @@ literal    = STRING | NUMBER | "true" | "false" ;
 STRING     = '"' { char } '"' ;
 ```
 
-Keywords are case-insensitive. Precedence: `not` > `and` > `or`.
+Lexical rules:
+
+- Keywords (`and or not in contains true false`) are case-insensitive.
+- `IDENT` = `[A-Za-z_][A-Za-z0-9_.]*` (e.g. `user.id`). Field names with other characters
+  cannot be filtered on yet.
+- Strings use double or single quotes, so filters are easy to pass from a shell:
+  `FILTER 'source == "hr.md"'`. Escapes: `\" \' \\ \n \t \r`.
+- `NUMBER` = `[+-]digits[.digits][e[+-]digits]`. Without `.`/`e` it is an int64, else a float64.
+- `not` may be repeated (`not not x == 1`).
+
+Precedence: `not` > `and` > `or`.
+
+Limits: 16 KiB per expression, nesting depth 64, 1024 values per `in` list.
 
 ### 6.2 Semantics
 
-- Missing field → comparison is `false` (so `not field == x` is `true`).
-- Type mismatch (e.g. `page == "3"` when `page` is int) → `false`, not an error.
-- int and float compare numerically.
+- Missing field → comparison is `false`, for `!=` too (so `not field == x` is `true`,
+  but `field != x` is `false` when the field is missing).
+- Type mismatch at evaluation (e.g. `page == "3"` when `page` is int) → `false`, not an error.
+- Type errors visible at parse time are errors: `<`, `<=`, `>`, `>=` need a number literal.
+- int and float compare numerically (`page == 3.0` matches `3`).
+- `contains` only matches string-list fields; `in` only matches scalar fields.
+- Parse errors report the byte position: `-ERR invalid filter: <reason> at position <n>`.
 - Parsed once per `VSEARCH`, evaluated per record (brute force) **before** distance computation.
 
 Example:
@@ -517,8 +547,8 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | `-ERR zero vector is not allowed with cosine metric`         | zero vector, cosine           |
 | `-ERR vector contains NaN or Inf`                            | non-finite value              |
 | `-ERR K must be an integer between 1 and 10000`              | bad `K`                       |
-| `-ERR invalid metadata: <reason>`                            | bad META JSON                 |
-| `-ERR invalid filter: <reason>`                              | filter parse error            |
+| `-ERR invalid metadata: <reason>`                            | bad `META` JSON               |
+| `-ERR invalid filter: <reason> at position <n>`              | bad `FILTER` expression       |
 | `-ERR max_vectors reached`                                   | limit hit with `noeviction`   |
 | `-OOM command not allowed when used memory > 'maxmemory'`    | memory limit, cannot evict    |
 | `-ERR snapshot disabled: start server with --dir`            | `SAVE` without `--dir`        |
@@ -534,7 +564,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 |-----------|-------|-----------|
 | **M0** Skeleton ✅ | RESP2/RESP3 parser/writer, TCP server, courtesy commands | `redis-cli -p 6380 ping` → `PONG`; `redis-py` connects with default settings |
 | **M1** Core vectors ✅ | Collections, slab, `VADD/VGET/VDEL/VEXISTS/VCOUNT`, `VALUES`/`FP32`, Flat `VSEARCH` (no filter) | Python script inserts 10k vectors and gets correct top-K vs NumPy |
-| **M2** Metadata & filter | `TEXT`, `META`, filter lexer/parser/evaluator, `WITH*` flags | Filter unit tests incl. `and/or/not/()`, `in`, `contains` |
+| **M2** Metadata & filter ✅ | `TEXT`, `META`, filter lexer/parser/evaluator, `WITH*` flags | Filter unit tests incl. `and/or/not/()`, `in`, `contains` |
 | **M3** TTL | `EX/PX`, `VEXPIRE/VTTL/VPERSIST`, lazy + active expiry | Records disappear after TTL; `VTTL` matches Redis semantics |
 | **M4** Limits & eviction | MemTracker, `maxmemory`, `max_vectors`, 3 policies, `VCONFIG`, `VINFO`, `INFO` | Eviction tests per policy; `noeviction` returns errors |
 | **M5** Snapshot | `.lwdb` writer/reader, save rules, `SAVE`, shutdown save, startup load | Restart restores identical search results; corrupt file detected |

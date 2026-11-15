@@ -9,7 +9,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/tranbaohieu/lawliet/internal/filter"
 	"github.com/tranbaohieu/lawliet/internal/index"
+	"github.com/tranbaohieu/lawliet/internal/meta"
 )
 
 func mustCreate(t *testing.T, s *Store, name string, dim int, m index.Metric) *Collection {
@@ -62,20 +64,20 @@ func TestCreateValidation(t *testing.T) {
 func TestAddModesAndGet(t *testing.T) {
 	c := mustCreate(t, New(), "c", 2, index.IP)
 
-	if r, err := c.Add("a", []float32{1, 2}, Upsert); err != nil || r != Inserted {
+	if r, err := c.Add("a", Record{Vector: []float32{1, 2}}, Upsert); err != nil || r != Inserted {
 		t.Fatalf("insert: %v %v", r, err)
 	}
-	if r, _ := c.Add("a", []float32{3, 4}, OnlyNew); r != Skipped {
+	if r, _ := c.Add("a", Record{Vector: []float32{3, 4}}, OnlyNew); r != Skipped {
 		t.Fatalf("NX on existing: %v", r)
 	}
-	if r, _ := c.Add("b", []float32{1, 1}, OnlyExisting); r != Skipped {
+	if r, _ := c.Add("b", Record{Vector: []float32{1, 1}}, OnlyExisting); r != Skipped {
 		t.Fatalf("XX on missing: %v", r)
 	}
-	if r, _ := c.Add("a", []float32{5, 6}, OnlyExisting); r != Updated {
+	if r, _ := c.Add("a", Record{Vector: []float32{5, 6}}, OnlyExisting); r != Updated {
 		t.Fatalf("XX on existing: %v", r)
 	}
-	if v, ok := c.Get("a"); !ok || v[0] != 5 || v[1] != 6 {
-		t.Fatalf("Get after update: %v %v", v, ok)
+	if r, ok := c.Get("a"); !ok || r.Vector[0] != 5 || r.Vector[1] != 6 {
+		t.Fatalf("Get after update: %v %v", r, ok)
 	}
 	if c.Exists("b") || c.Count() != 1 {
 		t.Fatalf("Exists(b)=%v Count=%d", c.Exists("b"), c.Count())
@@ -85,13 +87,13 @@ func TestAddModesAndGet(t *testing.T) {
 func TestAddValidation(t *testing.T) {
 	cos := mustCreate(t, New(), "c", 3, index.Cosine)
 	var dm *DimMismatchError
-	if _, err := cos.Add("a", []float32{1, 2}, Upsert); !errors.As(err, &dm) || dm.Expected != 3 || dm.Got != 2 {
+	if _, err := cos.Add("a", Record{Vector: []float32{1, 2}}, Upsert); !errors.As(err, &dm) || dm.Expected != 3 || dm.Got != 2 {
 		t.Fatalf("dim mismatch: %v", err)
 	}
-	if _, err := cos.Add("a", []float32{0, 0, 0}, Upsert); !errors.Is(err, ErrZeroVector) {
+	if _, err := cos.Add("a", Record{Vector: []float32{0, 0, 0}}, Upsert); !errors.Is(err, ErrZeroVector) {
 		t.Fatalf("zero vector: %v", err)
 	}
-	if _, err := cos.Add("a", []float32{1, float32(math.NaN()), 0}, Upsert); !errors.Is(err, ErrNonFinite) {
+	if _, err := cos.Add("a", Record{Vector: []float32{1, float32(math.NaN()), 0}}, Upsert); !errors.Is(err, ErrNonFinite) {
 		t.Fatalf("NaN: %v", err)
 	}
 	if cos.Count() != 0 {
@@ -102,13 +104,14 @@ func TestAddValidation(t *testing.T) {
 func TestCosineStoresNormalizedCopy(t *testing.T) {
 	c := mustCreate(t, New(), "c", 2, index.Cosine)
 	in := []float32{3, 4}
-	if _, err := c.Add("a", in, Upsert); err != nil {
+	if _, err := c.Add("a", Record{Vector: in}, Upsert); err != nil {
 		t.Fatal(err)
 	}
 	if in[0] != 3 || in[1] != 4 {
 		t.Fatal("caller's slice was modified")
 	}
-	v, _ := c.Get("a")
+	rec, _ := c.Get("a")
+	v := rec.Vector
 	if math.Abs(float64(v[0])-0.6) > 1e-6 || math.Abs(float64(v[1])-0.8) > 1e-6 {
 		t.Fatalf("stored %v, want [0.6 0.8]", v)
 	}
@@ -117,7 +120,7 @@ func TestCosineStoresNormalizedCopy(t *testing.T) {
 func TestDeleteReusesSlots(t *testing.T) {
 	c := mustCreate(t, New(), "c", 1, index.IP)
 	for i := 0; i < 5; i++ {
-		c.Add(fmt.Sprint(i), []float32{float32(i)}, Upsert)
+		c.Add(fmt.Sprint(i), Record{Vector: []float32{float32(i)}}, Upsert)
 	}
 	if n := c.Delete("1", "3", "missing"); n != 2 {
 		t.Fatalf("Delete = %d", n)
@@ -125,13 +128,13 @@ func TestDeleteReusesSlots(t *testing.T) {
 	if c.Exists("1") || c.Count() != 3 {
 		t.Fatal("deleted record still present")
 	}
-	c.Add("x", []float32{9}, Upsert)
-	c.Add("y", []float32{8}, Upsert)
+	c.Add("x", Record{Vector: []float32{9}}, Upsert)
+	c.Add("y", Record{Vector: []float32{8}}, Upsert)
 	if info := c.Info(); info.Slots != 5 || info.Count != 5 {
 		t.Fatalf("slots should be reused: %+v", info)
 	}
 	// Deleted records never appear in search results.
-	res, _ := c.Search([]float32{1}, 10, false)
+	res, _ := c.Search([]float32{1}, SearchOptions{K: 10})
 	ids := make([]string, len(res))
 	for i, r := range res {
 		ids[i] = r.ID
@@ -145,10 +148,11 @@ func TestSlabCrossesChunks(t *testing.T) {
 	c := mustCreate(t, New(), "c", 3, index.IP)
 	n := ChunkSize*2 + 7
 	for i := 0; i < n; i++ {
-		c.Add(fmt.Sprint(i), []float32{float32(i), 1, -1}, Upsert)
+		c.Add(fmt.Sprint(i), Record{Vector: []float32{float32(i), 1, -1}}, Upsert)
 	}
 	for _, i := range []int{0, ChunkSize - 1, ChunkSize, 2 * ChunkSize, n - 1} {
-		v, ok := c.Get(fmt.Sprint(i))
+		rec, ok := c.Get(fmt.Sprint(i))
+		v := rec.Vector
 		if !ok || v[0] != float32(i) || v[1] != 1 || v[2] != -1 {
 			t.Fatalf("slot %d: %v %v", i, v, ok)
 		}
@@ -216,7 +220,7 @@ func TestSearchMatchesBruteForce(t *testing.T) {
 				}
 				id := fmt.Sprintf("doc:%d", i)
 				data[id] = v
-				if _, err := c.Add(id, v, Upsert); err != nil {
+				if _, err := c.Add(id, Record{Vector: v}, Upsert); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -225,7 +229,7 @@ func TestSearchMatchesBruteForce(t *testing.T) {
 				for j := range q {
 					q[j] = r.Float32()*2 - 1
 				}
-				res, err := c.Search(q, k, false)
+				res, err := c.Search(q, SearchOptions{K: k})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -254,7 +258,7 @@ func TestConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < 500; i++ {
 				id := fmt.Sprintf("%d-%d", w, i%50)
-				c.Add(id, []float32{1, float32(i), 0, 0, 0, 0, 0, 1}, Upsert)
+				c.Add(id, Record{Vector: []float32{1, float32(i), 0, 0, 0, 0, 0, 1}}, Upsert)
 				if i%7 == 0 {
 					c.Delete(id)
 				}
@@ -263,7 +267,7 @@ func TestConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-				if _, err := c.Search([]float32{1, 0, 0, 0, 0, 0, 0, 0}, 5, true); err != nil {
+				if _, err := c.Search([]float32{1, 0, 0, 0, 0, 0, 0, 0}, SearchOptions{K: 5, WithVectors: true, WithText: true, WithMeta: true}); err != nil {
 					t.Error(err)
 					return
 				}
@@ -274,5 +278,70 @@ func TestConcurrentAccess(t *testing.T) {
 	wg.Wait()
 	if info := c.Info(); info.Count != len(c.idToSlot) {
 		t.Fatalf("count %d != map size %d", info.Count, len(c.idToSlot))
+	}
+}
+
+func TestTextAndMeta(t *testing.T) {
+	c := mustCreate(t, New(), "c", 2, index.IP)
+	m := meta.Map{"source": {Kind: meta.String, S: "hr.md"}}
+	c.Add("a", Record{Vector: []float32{1, 0}, Text: "hello", Meta: m}, Upsert)
+
+	rec, ok := c.Get("a")
+	if !ok || rec.Text != "hello" || rec.Meta["source"].S != "hr.md" {
+		t.Fatalf("Get: %+v %v", rec, ok)
+	}
+
+	// Upsert replaces the whole record: text and meta not given are cleared.
+	c.Add("a", Record{Vector: []float32{0, 1}}, Upsert)
+	if rec, _ := c.Get("a"); rec.Text != "" || rec.Meta != nil {
+		t.Fatalf("upsert should clear text/meta: %+v", rec)
+	}
+
+	// A reused slot must not leak the previous record's text/meta.
+	c.Add("b", Record{Vector: []float32{1, 1}, Text: "old", Meta: m}, Upsert)
+	c.Delete("b")
+	c.Add("c", Record{Vector: []float32{1, 1}}, Upsert)
+	if rec, _ := c.Get("c"); rec.Text != "" || rec.Meta != nil {
+		t.Fatalf("reused slot leaked data: %+v", rec)
+	}
+}
+
+func TestSearchWithFilterAndFields(t *testing.T) {
+	c := mustCreate(t, New(), "c", 1, index.IP)
+	for i := 0; i < 10; i++ {
+		m := meta.Map{"even": {Kind: meta.Bool, B: i%2 == 0}}
+		c.Add(fmt.Sprint(i), Record{Vector: []float32{float32(i)}, Text: fmt.Sprintf("t%d", i), Meta: m}, Upsert)
+	}
+	f, err := filter.Parse("even == true")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The filter is applied before ranking: top 3 of the even IDs, not evens among the top 3.
+	res, err := c.Search([]float32{1}, SearchOptions{K: 3, Filter: f.Match, WithText: true, WithMeta: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, r := range res {
+		got = append(got, r.ID+"/"+r.Text)
+		if !r.Meta["even"].B || r.Vector != nil {
+			t.Fatalf("unexpected result fields: %+v", r)
+		}
+	}
+	if fmt.Sprint(got) != "[8/t8 6/t6 4/t4]" {
+		t.Fatalf("got %v", got)
+	}
+
+	// Without With* options, optional fields stay empty.
+	res, _ = c.Search([]float32{1}, SearchOptions{K: 1})
+	if res[0].Text != "" || res[0].Meta != nil {
+		t.Fatalf("fields should not be set: %+v", res[0])
+	}
+
+	// A filter that matches nothing returns no results.
+	none, _ := filter.Parse("even == 1")
+	if res, _ := c.Search([]float32{1}, SearchOptions{K: 3, Filter: none.Match}); len(res) != 0 {
+		t.Fatalf("want no results, got %+v", res)
 	}
 }

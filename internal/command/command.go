@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/tranbaohieu/lawliet/internal/filter"
+	"github.com/tranbaohieu/lawliet/internal/meta"
 	"github.com/tranbaohieu/lawliet/internal/server"
 	"github.com/tranbaohieu/lawliet/internal/store"
 )
@@ -45,10 +47,14 @@ func writeErr(c *server.Conn, err error) {
 	var ce cmdError
 	var cfg *store.ConfigError
 	var dim *store.DimMismatchError
+	var me *meta.Error
+	var fe *filter.Error
 	switch {
 	case errors.As(err, &ce),
 		errors.As(err, &cfg),
 		errors.As(err, &dim),
+		errors.As(err, &me),
+		errors.As(err, &fe),
 		errors.Is(err, store.ErrCollectionNotFound),
 		errors.Is(err, store.ErrCollectionExists),
 		errors.Is(err, store.ErrZeroVector),

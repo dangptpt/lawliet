@@ -107,7 +107,11 @@ func TestRecordErrors(t *testing.T) {
 		{[]any{"VADD", "v", "a", "VALUES", 3, "0", "0", "0"}, "ERR zero vector is not allowed with cosine metric"},
 		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "NaN", "0"}, "ERR vector contains NaN or Inf"},
 		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "NX", "XX"}, "ERR syntax error"},
-		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "TEXT", "x"}, "ERR syntax error"},
+		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "TEXT"}, "ERR syntax error"},
+		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "META"}, "ERR syntax error"},
+		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "META", `{"a":{"b":1}}`}, "ERR invalid metadata: field 'a': nested object not allowed"},
+		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "META", `[1]`}, "ERR invalid metadata: must be a JSON object"},
+		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "EX", 10}, "ERR syntax error"},
 		{[]any{"VADD", "v", "a", "VECTOR", "1"}, "ERR expected FP32 or VALUES, got 'VECTOR'"},
 		{[]any{"VGET", "v", "a", "BOGUS"}, "ERR syntax error"},
 	}
@@ -135,7 +139,8 @@ func TestSearch(t *testing.T) {
 
 	wantErr(t, c.Do("VSEARCH", "v", "VALUES", 2, "1", "0", "K", 0), "ERR K must be an integer between 1 and 10000")
 	wantErr(t, c.Do("VSEARCH", "v", "VALUES", 2, "1", "0", "K"), "ERR syntax error")
-	wantErr(t, c.Do("VSEARCH", "v", "VALUES", 2, "1", "0", "FILTER", "x"), "ERR syntax error")
+	wantErr(t, c.Do("VSEARCH", "v", "VALUES", 2, "1", "0", "FILTER"), "ERR syntax error")
+	wantErr(t, c.Do("VSEARCH", "v", "VALUES", 2, "1", "0", "FILTER", "x"), "ERR invalid filter: expected operator after field 'x'")
 	wantErr(t, c.Do("VSEARCH", "v", "VALUES", 1, "1"), "ERR dimension mismatch")
 }
 
@@ -168,4 +173,81 @@ func TestDecodeEncodeFP32(t *testing.T) {
 	if b := encodeFP32([]float32{1}); string(b) != "\x00\x00\x80\x3f" {
 		t.Fatalf("not little-endian: % x", b)
 	}
+}
+
+func TestTextAndMeta(t *testing.T) {
+	c := newClient(t)
+	c.Do("VCREATE", "docs", "DIM", 2, "METRIC", "ip")
+
+	want(t, c.Do("VADD", "docs", "a", "VALUES", 2, "1", "0",
+		"TEXT", "Chính sách nghỉ phép", "META", `{"source":"hr.md","page":3,"tags":["hr","policy"]}`), ":1")
+	want(t, c.Do("VGET", "docs", "a"),
+		`*[$"Chính sách nghỉ phép" $"{\"page\":3,\"source\":\"hr.md\",\"tags\":[\"hr\",\"policy\"]}"]`)
+
+	// Upsert without TEXT/META clears them.
+	want(t, c.Do("VADD", "docs", "a", "VALUES", 2, "1", "0"), ":0")
+	want(t, c.Do("VGET", "docs", "a"), "*[nil nil]")
+
+	// Empty META object is stored as "no metadata".
+	c.Do("VADD", "docs", "b", "VALUES", 2, "1", "0", "META", "{}", "TEXT", "x")
+	want(t, c.Do("VGET", "docs", "b"), `*[$"x" nil]`)
+}
+
+func TestSearchFilterAndFields(t *testing.T) {
+	c := newClient(t)
+	c.Do("VCREATE", "docs", "DIM", 1, "METRIC", "ip")
+	docs := []struct {
+		id, text, meta string
+		v              string
+	}{
+		{"hr1", "leave policy", `{"source":"hr.md","page":1,"tags":["hr"]}`, "0.9"},
+		{"hr2", "leave days", `{"source":"hr.md","page":5,"tags":["hr","draft"]}`, "0.8"},
+		{"it1", "vpn setup", `{"source":"it.md","page":2,"tags":["it"]}`, "0.95"},
+		{"ops1", "on-call", `{"source":"ops.md","page":3}`, "0.7"},
+		{"none", "no meta", ``, "1.0"},
+	}
+	for _, d := range docs {
+		args := []any{"VADD", "docs", d.id, "VALUES", 1, d.v, "TEXT", d.text}
+		if d.meta != "" {
+			args = append(args, "META", d.meta)
+		}
+		want(t, c.Do(args...), ":1")
+	}
+
+	ids := func(v resp.Value) string {
+		var out []string
+		for _, h := range v.Array {
+			out = append(out, h.Array[0].Str)
+		}
+		return strings.Join(out, ",")
+	}
+	q := []any{"VSEARCH", "docs", "VALUES", 1, "1"}
+	search := func(extra ...any) resp.Value { return c.Do(append(append([]any{}, q...), extra...)...) }
+
+	if got := ids(search()); got != "none,it1,hr1,hr2,ops1" {
+		t.Fatalf("no filter: %s", got)
+	}
+	if got := ids(search("FILTER", `source == "hr.md"`)); got != "hr1,hr2" {
+		t.Fatalf("source filter: %s", got)
+	}
+	if got := ids(search("FILTER", `(source == "hr.md" or source in ["it.md", "ops.md"]) and page >= 2 and not tags contains "draft"`)); got != "it1,ops1" {
+		t.Fatalf("design example: %s", got)
+	}
+	if got := ids(search("FILTER", `not source == "hr.md"`)); got != "none,it1,ops1" {
+		t.Fatalf("not on missing field: %s", got)
+	}
+	if got := ids(search("FILTER", `page > 100`)); got != "" {
+		t.Fatalf("no match: %s", got)
+	}
+	if got := ids(search("FILTER", `source == "hr.md"`, "K", 1)); got != "hr1" {
+		t.Fatalf("filter + K: %s", got)
+	}
+
+	// Optional fields come in fixed order: id, score, text, meta, vector — whatever the flag order.
+	want(t, search("FILTER", `source == "ops.md"`, "WITHVEC", "WITHMETA", "WITHTEXT"),
+		`*[*[$"ops1" $"0.7" $"on-call" $"{\"page\":3,\"source\":\"ops.md\"}" $`+strconv.Quote(string(encodeFP32([]float32{0.7})))+`]]`)
+	want(t, search("FILTER", `source == "ops.md"`, "WITHMETA"),
+		`*[*[$"ops1" $"0.7" $"{\"page\":3,\"source\":\"ops.md\"}"]]`)
+	// Missing meta is null.
+	want(t, search("K", 1, "WITHTEXT", "WITHMETA"), `*[*[$"none" $"1" $"no meta" nil]]`)
 }

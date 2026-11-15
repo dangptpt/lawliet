@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/tranbaohieu/lawliet/internal/index"
+	"github.com/tranbaohieu/lawliet/internal/meta"
 	"github.com/tranbaohieu/lawliet/internal/vecmath"
 )
 
@@ -51,11 +52,30 @@ const (
 	Skipped // NX/XX condition not met
 )
 
-// Result is one search hit with its external ID.
+// Record is the content of one entry. Meta is treated as immutable once stored.
+type Record struct {
+	Vector []float32
+	Text   string
+	Meta   meta.Map // nil = no metadata
+}
+
+// SearchOptions controls Search.
+type SearchOptions struct {
+	K           int
+	Filter      func(meta.Map) bool // nil = no filter
+	WithVectors bool
+	WithText    bool
+	WithMeta    bool
+}
+
+// Result is one search hit with its external ID. Optional fields are set
+// only when requested in SearchOptions.
 type Result struct {
 	ID     string
 	Score  float32
-	Vector []float32 // set only when requested
+	Vector []float32
+	Text   string
+	Meta   meta.Map
 }
 
 // Info is a snapshot of collection statistics.
@@ -80,6 +100,8 @@ type Collection struct {
 	vectors  *VectorSlab
 	idToSlot map[string]uint32
 	slotToID []string
+	texts    []string
+	metas    []meta.Map
 	deleted  []bool
 	freeList []uint32
 	live     int
@@ -129,8 +151,9 @@ func (c *Collection) prepare(v []float32) ([]float32, error) {
 }
 
 // Add inserts or updates the record id according to mode.
-func (c *Collection) Add(id string, vec []float32, mode AddMode) (AddResult, error) {
-	v, err := c.prepare(vec)
+// An update replaces the whole record: text and metadata not given are cleared.
+func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error) {
+	v, err := c.prepare(rec.Vector)
 	if err != nil {
 		return 0, err
 	}
@@ -144,6 +167,8 @@ func (c *Collection) Add(id string, vec []float32, mode AddMode) (AddResult, err
 		}
 		c.idx.Remove(slot)
 		c.vectors.Set(slot, v)
+		c.texts[slot] = rec.Text
+		c.metas[slot] = rec.Meta
 		c.idx.Add(slot, v)
 		return Updated, nil
 	}
@@ -156,10 +181,14 @@ func (c *Collection) Add(id string, vec []float32, mode AddMode) (AddResult, err
 		slot = c.freeList[n-1]
 		c.freeList = c.freeList[:n-1]
 		c.slotToID[slot] = id
+		c.texts[slot] = rec.Text
+		c.metas[slot] = rec.Meta
 		c.deleted[slot] = false
 	} else {
 		slot = uint32(len(c.slotToID))
 		c.slotToID = append(c.slotToID, id)
+		c.texts = append(c.texts, rec.Text)
+		c.metas = append(c.metas, rec.Meta)
 		c.deleted = append(c.deleted, false)
 	}
 	c.vectors.Set(slot, v)
@@ -169,15 +198,19 @@ func (c *Collection) Add(id string, vec []float32, mode AddMode) (AddResult, err
 	return Inserted, nil
 }
 
-// Get returns a copy of the stored vector (normalized for cosine).
-func (c *Collection) Get(id string) ([]float32, bool) {
+// Get returns the record. The vector is a copy (normalized for cosine).
+func (c *Collection) Get(id string) (Record, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	slot, ok := c.idToSlot[id]
 	if !ok {
-		return nil, false
+		return Record{}, false
 	}
-	return slices.Clone(c.vectors.Get(slot)), true
+	return Record{
+		Vector: slices.Clone(c.vectors.Get(slot)),
+		Text:   c.texts[slot],
+		Meta:   c.metas[slot],
+	}, true
 }
 
 // Exists reports whether id is present.
@@ -201,6 +234,8 @@ func (c *Collection) Delete(ids ...string) int {
 		c.idx.Remove(slot)
 		delete(c.idToSlot, id)
 		c.slotToID[slot] = ""
+		c.texts[slot] = "" // release memory to the GC
+		c.metas[slot] = nil
 		c.deleted[slot] = true
 		c.freeList = append(c.freeList, slot)
 		c.live--
@@ -216,8 +251,10 @@ func (c *Collection) Count() int {
 	return c.live
 }
 
-// Search returns up to k records most similar to query, best first.
-func (c *Collection) Search(query []float32, k int, withVectors bool) ([]Result, error) {
+// Search returns up to opt.K records most similar to query, best first.
+// The filter runs before the distance computation, so filtered-out records cost
+// only a metadata check.
+func (c *Collection) Search(query []float32, opt SearchOptions) ([]Result, error) {
 	q, err := c.prepare(query)
 	if err != nil {
 		return nil, err
@@ -226,13 +263,25 @@ func (c *Collection) Search(query []float32, k int, withVectors bool) ([]Result,
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	hits := c.idx.Search(q, k, func(slot uint32) bool { return !c.deleted[slot] })
+	accept := func(slot uint32) bool { return !c.deleted[slot] }
+	if opt.Filter != nil {
+		accept = func(slot uint32) bool { return !c.deleted[slot] && opt.Filter(c.metas[slot]) }
+	}
+
+	hits := c.idx.Search(q, opt.K, accept)
 	out := make([]Result, len(hits))
 	for i, h := range hits {
-		out[i] = Result{ID: c.slotToID[h.Slot], Score: h.Score}
-		if withVectors {
-			out[i].Vector = slices.Clone(c.vectors.Get(h.Slot))
+		r := Result{ID: c.slotToID[h.Slot], Score: h.Score}
+		if opt.WithVectors {
+			r.Vector = slices.Clone(c.vectors.Get(h.Slot))
 		}
+		if opt.WithText {
+			r.Text = c.texts[h.Slot]
+		}
+		if opt.WithMeta {
+			r.Meta = c.metas[h.Slot]
+		}
+		out[i] = r
 	}
 	return out, nil
 }
