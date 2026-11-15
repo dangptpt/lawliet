@@ -167,9 +167,20 @@ Design decisions live in [DESIGN.md](DESIGN.md); known debts in [TECH_DEBT.md](T
 
 ## Roadmap
 
-HNSW index · HTTP/REST API · batch insert · metadata indexes · quantization (int8,
-float16) · parallel search and SIMD · AUTH/TLS · LangChain and LlamaIndex adapters ·
-slab compaction (TD-1). See [DESIGN.md §14](DESIGN.md).
+Lawliet aims to be a **semantic cache and vector store for LLM apps** rather than a
+general-purpose vector database ([DESIGN.md §1.3](DESIGN.md)). Next, in priority order
+(drafts in [DESIGN.md §16](DESIGN.md)):
+
+1. **`VCACHE.*` semantic cache commands** — threshold lookup, default TTL, hit/miss stats,
+   invalidation by filter.
+2. **LangChain and LlamaIndex adapters** — vector store and semantic cache.
+3. **Approximate index** — spike IVF trained with e-means vs HNSW, then implement the winner.
+4. **Server-side embedding** — send text, the server computes vectors (Ollama /
+   OpenAI-compatible).
+5. **Slab compaction** so `--maxmemory` bounds real memory ([TD-1](TECH_DEBT.md)).
+
+Later: HTTP/REST API · batch insert and delete by filter · metadata indexes · quantization
+(int8, float16) · parallel search and SIMD · AUTH/TLS.
 
 ## License
 
