@@ -7,13 +7,18 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 )
 
 // Config holds server settings. More fields are added per milestone (see DESIGN.md §12).
 type Config struct {
-	Bind        string
-	Port        int
-	ShowVersion bool
+	Bind           string
+	Port           int
+	MaxMemory      int64  // bytes, 0 = unlimited
+	MaxMemoryRaw   string // as given, e.g. "2gb"
+	MaxMemoryPol   string // default eviction policy for new collections
+	MaxCollections int    // 0 = unlimited
+	ShowVersion    bool
 }
 
 // Addr returns the listen address "bind:port".
@@ -26,6 +31,10 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	fs.SetOutput(out)
 	fs.StringVar(&c.Bind, "bind", "127.0.0.1", "interface to listen on")
 	fs.IntVar(&c.Port, "port", 6380, "TCP port")
+	fs.StringVar(&c.MaxMemoryRaw, "maxmemory", "0", "memory limit for records, e.g. 512mb, 2gb (0 = unlimited)")
+	fs.StringVar(&c.MaxMemoryPol, "maxmemory-policy", "noeviction",
+		"default eviction policy for new collections: noeviction, allkeys-lru, volatile-ttl")
+	fs.IntVar(&c.MaxCollections, "max-collections", 0, "maximum number of collections (0 = unlimited)")
 	fs.BoolVar(&c.ShowVersion, "version", false, "print version and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -37,5 +46,38 @@ func Parse(args []string, out io.Writer) (Config, error) {
 	if c.Port < 0 || c.Port > 65535 {
 		return Config{}, fmt.Errorf("invalid --port %d: must be 0-65535", c.Port)
 	}
+	n, err := ParseSize(c.MaxMemoryRaw)
+	if err != nil {
+		return Config{}, fmt.Errorf("invalid --maxmemory: %w", err)
+	}
+	c.MaxMemory = n
+	if c.MaxCollections < 0 {
+		return Config{}, fmt.Errorf("invalid --max-collections %d: must be >= 0", c.MaxCollections)
+	}
 	return c, nil
+}
+
+// ParseSize parses a memory size like Redis: a plain number of bytes, or a
+// number with a unit. k/m/g are powers of 1000, kb/mb/gb powers of 1024.
+func ParseSize(s string) (int64, error) {
+	t := strings.ToLower(strings.TrimSpace(s))
+	units := []struct {
+		suffix string
+		mult   int64
+	}{
+		{"kb", 1 << 10}, {"mb", 1 << 20}, {"gb", 1 << 30},
+		{"k", 1e3}, {"m", 1e6}, {"g", 1e9}, {"b", 1},
+	}
+	mult := int64(1)
+	for _, u := range units {
+		if strings.HasSuffix(t, u.suffix) {
+			t, mult = strings.TrimSuffix(t, u.suffix), u.mult
+			break
+		}
+	}
+	n, err := strconv.ParseInt(t, 10, 64)
+	if err != nil || n < 0 || (n > 0 && mult > (1<<62)/n) {
+		return 0, fmt.Errorf("%q is not a valid size (examples: 1048576, 512mb, 2gb)", s)
+	}
+	return n * mult, nil
 }

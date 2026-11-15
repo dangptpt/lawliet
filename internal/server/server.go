@@ -36,6 +36,7 @@ type Server struct {
 	commands map[string]*command
 	stats    Stats
 	nextID   atomic.Int64
+	info     []infoProvider // extra INFO fields, registered at startup
 
 	mu    sync.Mutex
 	ln    net.Listener
@@ -57,6 +58,20 @@ func New(addr string, logger *slog.Logger) *Server {
 	}
 	registerConnCommands(s)
 	return s
+}
+
+// InfoFunc returns key/value pairs for an INFO section.
+type InfoFunc func() [][2]string
+
+type infoProvider struct {
+	section string
+	fn      InfoFunc
+}
+
+// AddInfo appends fields to an INFO section (lower-case name, e.g. "memory").
+// New section names are listed after the built-in ones. Call before serving.
+func (s *Server) AddInfo(section string, fn InfoFunc) {
+	s.info = append(s.info, infoProvider{section: strings.ToLower(section), fn: fn})
 }
 
 // Register adds a command. Names are case-insensitive. Panics on duplicates (programming error).

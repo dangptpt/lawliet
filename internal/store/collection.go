@@ -12,11 +12,17 @@ import (
 // MaxDim is the largest supported vector dimension.
 const MaxDim = 65536
 
-// Config is the immutable configuration of a collection.
+// MaxVectorsLimit is the largest accepted max_vectors value.
+const MaxVectorsLimit = 1<<31 - 1
+
+// Config is the configuration of a collection. Dim, Metric and Index are
+// immutable; MaxVectors and Policy can be changed with SetMaxVectors / SetPolicy.
 type Config struct {
-	Dim    int
-	Metric index.Metric
-	Index  string // "flat" (MVP)
+	Dim        int
+	Metric     index.Metric
+	Index      string // "flat" (MVP)
+	MaxVectors int    // 0 = unlimited
+	Policy     Policy
 }
 
 func (c Config) validate() error {
@@ -30,6 +36,14 @@ func (c Config) validate() error {
 	}
 	if c.Index != "flat" {
 		return &ConfigError{Msg: "unsupported index '" + c.Index + "' (MVP supports: flat)"}
+	}
+	if c.MaxVectors < 0 || c.MaxVectors > MaxVectorsLimit {
+		return &ConfigError{Msg: "MAX_VECTORS must be between 0 and 2147483647"}
+	}
+	switch c.Policy {
+	case NoEviction, AllKeysLRU, VolatileTTL:
+	default:
+		return &ConfigError{Msg: "invalid policy"}
 	}
 	return nil
 }
@@ -87,6 +101,7 @@ type Info struct {
 	Expires     int   // records with a TTL
 	Slots       int   // allocated slots, including tombstones
 	VectorBytes int64 // memory held by the vector slab
+	MemoryBytes int64 // estimated memory of all records (DESIGN.md §8.2)
 }
 
 // Collection holds records of one vector space.
@@ -101,27 +116,31 @@ type Collection struct {
 	mu   sync.RWMutex
 	name string
 	cfg  Config
+	st   *Store       // owner: memory accounting and statistics
 	now  func() int64 // unix ms; injectable for tests
 
-	vectors  *VectorSlab
-	idToSlot map[string]uint32
-	slotToID []string
-	texts    []string
-	metas    []meta.Map
-	expireAt []int64
-	deleted  []bool
-	freeList []uint32
-	ttlSlots map[uint32]struct{} // slots with expireAt != 0
-	live     int
+	vectors    *VectorSlab
+	idToSlot   map[string]uint32
+	slotToID   []string
+	texts      []string
+	metas      []meta.Map
+	expireAt   []int64
+	lastAccess []int64 // unix ms, updated atomically (also under the read lock)
+	deleted    []bool
+	freeList   []uint32
+	ttlSlots   map[uint32]struct{} // slots with expireAt != 0
+	live       int
+	memBytes   int64 // estimated memory of this collection's records
 
 	idx index.Index
 }
 
-func newCollection(name string, cfg Config, now func() int64) *Collection {
+func newCollection(name string, cfg Config, st *Store) *Collection {
 	c := &Collection{
 		name:     name,
 		cfg:      cfg,
-		now:      now,
+		st:       st,
+		now:      st.now,
 		vectors:  NewVectorSlab(cfg.Dim),
 		idToSlot: make(map[string]uint32),
 		ttlSlots: make(map[uint32]struct{}),
@@ -140,7 +159,11 @@ func (c *Collection) Vector(slot uint32) []float32 { return c.vectors.Get(slot) 
 func (c *Collection) Name() string { return c.name }
 
 // Config returns the collection configuration.
-func (c *Collection) Config() Config { return c.cfg }
+func (c *Collection) Config() Config {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cfg
+}
 
 // prepare validates v and returns the form to store or query with.
 // For cosine the vector is normalized into a copy; v itself is never modified.
@@ -172,16 +195,33 @@ func (c *Collection) lookup(id string, now int64) (slot uint32, ok, expired bool
 // Add inserts or updates the record id according to mode.
 // An update replaces the whole record: text, metadata and TTL not given are cleared.
 // An expired record counts as absent (NX succeeds, XX is skipped).
+//
+// Limits (DESIGN.md §8.4): maxmemory is enforced first, without holding the
+// collection lock (eviction may lock any collection); max_vectors is enforced
+// under the lock, for new records only.
 func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error) {
 	v, err := c.prepare(rec.Vector)
 	if err != nil {
 		return 0, err
 	}
+	newSize := recordBytes(c.cfg.Dim, id, rec.Text, rec.Meta)
+
+	// An update only needs the size difference.
+	c.mu.RLock()
+	var oldSize int64
+	if slot, ok, _ := c.lookup(id, c.now()); ok {
+		oldSize = c.slotBytes(slot)
+	}
+	c.mu.RUnlock()
+	if err := c.st.freeMemory(newSize - oldSize); err != nil {
+		return 0, err
+	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := c.now()
 
-	slot, ok, expired := c.lookup(id, c.now())
+	slot, ok, expired := c.lookup(id, now)
 	if expired {
 		c.removeSlot(id, slot)
 	}
@@ -189,16 +229,21 @@ func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error)
 		if mode == OnlyNew {
 			return Skipped, nil
 		}
+		c.addMem(newSize - c.slotBytes(slot))
 		c.idx.Remove(slot)
 		c.vectors.Set(slot, v)
 		c.texts[slot] = rec.Text
 		c.metas[slot] = rec.Meta
 		c.setExpire(slot, rec.ExpireAt)
+		c.touch(slot, now)
 		c.idx.Add(slot, v)
 		return Updated, nil
 	}
 	if mode == OnlyExisting {
 		return Skipped, nil
+	}
+	if err := c.makeRoom(); err != nil {
+		return 0, err
 	}
 
 	if n := len(c.freeList); n > 0 {
@@ -214,18 +259,22 @@ func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error)
 		c.texts = append(c.texts, rec.Text)
 		c.metas = append(c.metas, rec.Meta)
 		c.expireAt = append(c.expireAt, 0)
+		c.lastAccess = append(c.lastAccess, 0)
 		c.deleted = append(c.deleted, false)
 	}
 	c.setExpire(slot, rec.ExpireAt)
+	c.touch(slot, now)
 	c.vectors.Set(slot, v)
 	c.idToSlot[id] = slot
 	c.live++
+	c.addMem(newSize)
 	c.idx.Add(slot, v)
 	return Inserted, nil
 }
 
 // removeSlot deletes a record. Caller must hold c.mu for writing.
 func (c *Collection) removeSlot(id string, slot uint32) {
+	c.addMem(-c.slotBytes(slot))
 	c.idx.Remove(slot)
 	delete(c.idToSlot, id)
 	c.slotToID[slot] = ""
@@ -255,6 +304,7 @@ func (c *Collection) Get(id string) (Record, bool) {
 		Meta:     c.metas[slot],
 		ExpireAt: c.expireAt[slot],
 	}
+	c.touch(slot, now)
 	c.mu.RUnlock()
 	return rec, true
 }
@@ -323,6 +373,7 @@ func (c *Collection) Search(query []float32, opt SearchOptions) ([]Result, error
 	hits := c.idx.Search(q, opt.K, accept)
 	out := make([]Result, len(hits))
 	for i, h := range hits {
+		c.touch(h.Slot, now)
 		r := Result{ID: c.slotToID[h.Slot], Score: h.Score}
 		if opt.WithVectors {
 			r.Vector = slices.Clone(c.vectors.Get(h.Slot))
@@ -354,5 +405,6 @@ func (c *Collection) Info() Info {
 		Expires:     len(c.ttlSlots),
 		Slots:       len(c.slotToID),
 		VectorBytes: c.vectors.Bytes(),
+		MemoryBytes: c.memBytes,
 	}
 }

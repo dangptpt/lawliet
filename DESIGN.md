@@ -254,8 +254,11 @@ VCONFIG <col> SET POLICY <p>                                            → +OK
 VCONFIG <col> SET MAX_VECTORS <n>                                       → +OK
 ```
 
-`VINFO` reply is a map (flat array in RESP2). Fields: `name, dim, metric, index, count, expires, vector_bytes`;
-`max_vectors`, `policy` and `memory_bytes` are added in M4.
+`VINFO` reply is a map (flat array in RESP2). Fields: `name, dim, metric, index, count, expires,
+max_vectors, policy, memory_bytes` (estimated, §8.2), `vector_bytes` (allocated slab).
+
+`VCONFIG <col> SET` accepts several `param value` pairs; all are validated before any change is
+applied. Unknown or immutable parameters (`DIM`, `METRIC`, `INDEX`) are rejected.
 
 ### 5.2 Records
 
@@ -406,11 +409,32 @@ Example:
 Memory is **estimated**, not measured: each insert/delete adds/subtracts
 
 ```
-dim*4 + len(id)*2 + len(text) + Σ(meta key+value sizes) + ~64B overhead
+dim*4 + len(id)*2 + len(text) + metadata (48 + Σ(88 + len(key) + len(value))) + 96 overhead
 ```
 
-Upsert reserves only the delta. `INFO memory` reports both `used_memory_estimated`
-and `used_memory_runtime` (from `runtime/metrics`) so users can see the drift.
+Upsert reserves only the delta.
+
+**`maxmemory` limits the logical size of the records, not the process memory.**
+Measured with dim 1536 and `--maxmemory 20mb` (scripts/e2e/m4_limits.py):
+
+| Figure (`INFO memory`)       | Value    | What it is                                   |
+|------------------------------|----------|----------------------------------------------|
+| `used_memory_estimated`      | 20.0 MiB | the limited figure                           |
+| `used_memory_vector_slab`    | 30.0 MiB | allocated slab chunks                        |
+| `used_memory_heap_live`      | 31.1 MiB | Go heap in use after the last GC             |
+| `used_memory_runtime`        | 57.5 MiB | all memory mapped by the Go runtime          |
+
+Sources of the difference:
+
+1. **Chunk granularity**: slabs grow by 1024 vectors (6 MiB at dim 1536) per collection.
+2. **Freed slots stay allocated**: deleted, expired and evicted records leave slots that only
+   the same collection reuses; chunks are never returned. Evicting a cache to make room for
+   another collection frees *estimated* memory but not slab memory.
+3. **Go GC headroom**: by default the heap may grow to about 2× the live heap between GCs.
+   Users can set the standard `GOMEMLIMIT` environment variable to make the GC stricter.
+
+Tracked as **TD-1** in [TECH_DEBT.md](TECH_DEBT.md): return empty chunks / compact slabs, then
+optionally account allocated memory.
 
 ### 8.3 Policies (per collection)
 
@@ -420,7 +444,9 @@ and `used_memory_runtime` (from `runtime/metrics`) so users can see the drift.
 | `allkeys-lru`   | lowest `lastAccess` among N random samples |
 | `volatile-ttl`  | lowest `expireAt` among N random samples with TTL |
 
-`N = 5`. Approximate (sampling) by design, similar to Redis.
+`N = 5`. Approximate (sampling) by design, similar to Redis. Collections with ≤ 5 records
+consider every record (exact). Expired records in a sample are always chosen first.
+With 2000 records and 10% hot records, sampled LRU kept 198–200 of 200 hot records in tests.
 
 "Access" = `VADD`, `VGET`, or being returned in `VSEARCH` top-K.
 
@@ -428,19 +454,27 @@ and `used_memory_runtime` (from `runtime/metrics`) so users can see the drift.
 
 ```
 VADD
- 1. Store.freeMemory(need)          (no collection lock held)
-      while over maxmemory:
-        pick a random collection whose policy != noeviction
-        sample, evict worst
-        none available → -OOM
- 2. lock collection
- 3. if liveCount >= max_vectors:
-        policy == noeviction → -ERR max_vectors reached
-        else sample within this collection, evict worst
- 4. insert, unlock
+ 1. need = size(new record) − size(existing record, if any)
+ 2. Store.freeMemory(need)          (no collection lock held)
+      need > maxmemory              → -OOM (nothing is evicted)
+      while used + need > maxmemory:
+        a. reclaim expired records in any collection (no data loss)
+        b. pick a random collection whose policy != noeviction, evict one record
+        nothing left to reclaim or evict → -OOM
+ 3. lock collection
+ 4. new record and count >= max_vectors:
+        reclaim one expired record (sampled), else evict by policy,
+        else -ERR max_vectors reached
+ 5. insert, unlock
 ```
 
 Never call `freeMemory` while holding a collection lock (deadlock risk).
+Another writer may use freed memory between steps 2 and 5, so the limit can be exceeded by a
+few records under concurrency. Deletes, reads, `VEXPIRE`, `VPERSIST` and `VCONFIG` are always
+allowed at the limit.
+
+`INFO` also reports `maxmemory`, `maxmemory_policy` (default for new collections),
+`evicted_keys` (stats) and a `keyspace` section with `collections` and `max_collections`.
 
 ---
 
@@ -569,7 +603,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | `-ERR invalid metadata: <reason>`                            | bad `META` JSON               |
 | `-ERR invalid expire time`                                   | bad `EX`/`PX`/`VEXPIRE` value |
 | `-ERR invalid filter: <reason> at position <n>`              | bad `FILTER` expression       |
-| `-ERR max_vectors reached`                                   | limit hit with `noeviction`   |
+| `-ERR max_vectors reached`                                   | limit hit, nothing evictable  |
 | `-OOM command not allowed when used memory > 'maxmemory'`    | memory limit, cannot evict    |
 | `-ERR snapshot disabled: start server with --dir`            | `SAVE` without `--dir`        |
 | `-NOPROTO unsupported protocol version`                      | `HELLO` with version other than 2/3 |
@@ -586,7 +620,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | **M1** Core vectors ✅ | Collections, slab, `VADD/VGET/VDEL/VEXISTS/VCOUNT`, `VALUES`/`FP32`, Flat `VSEARCH` (no filter) | Python script inserts 10k vectors and gets correct top-K vs NumPy |
 | **M2** Metadata & filter ✅ | `TEXT`, `META`, filter lexer/parser/evaluator, `WITH*` flags | Filter unit tests incl. `and/or/not/()`, `in`, `contains` |
 | **M3** TTL ✅ | `EX/PX`, `VEXPIRE/VTTL/VPERSIST`, lazy + active expiry | Records disappear after TTL; `VTTL` matches Redis semantics |
-| **M4** Limits & eviction | MemTracker, `maxmemory`, `max_vectors`, 3 policies, `VCONFIG`, `VINFO`, `INFO` | Eviction tests per policy; `noeviction` returns errors |
+| **M4** Limits & eviction ✅ | MemTracker, `maxmemory`, `max_vectors`, 3 policies, `VCONFIG`, `VINFO`, `INFO` | Eviction tests per policy; `noeviction` returns errors |
 | **M5** Snapshot | `.lwdb` writer/reader, save rules, `SAVE`, shutdown save, startup load | Restart restores identical search results; corrupt file detected |
 | **M6** Release | README quickstart, Python RAG example, Dockerfile, GitHub Actions CI, benchmark script | `docker run` + example works end-to-end |
 
@@ -601,6 +635,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 - AUTH / TLS
 - LangChain & LlamaIndex adapters
 - Chunked/incremental snapshot to reduce write blocking
+- Return empty slab chunks / compact slabs so evicted memory is really freed (§8.2, TD-1)
 
 ---
 

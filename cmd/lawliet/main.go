@@ -41,11 +41,22 @@ func run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	policy, err := store.ParsePolicy(cfg.MaxMemoryPol)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "lawliet: invalid --maxmemory-policy:", err)
+		return 2
+	}
 	st := store.New()
+	st.SetLimits(store.Limits{
+		MaxMemory:      cfg.MaxMemory,
+		MaxCollections: cfg.MaxCollections,
+		DefaultPolicy:  policy,
+	})
 	go st.RunExpirer(ctx, 100*time.Millisecond)
 
 	srv := server.New(cfg.Addr(), logger)
 	command.Register(srv, st)
+	command.RegisterInfo(srv, st)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		logger.Error("server error", "err", err)
 		return 1

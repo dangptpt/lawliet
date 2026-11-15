@@ -27,7 +27,8 @@ func Register(srv *server.Server, st *store.Store) {
 	srv.Register("vdrop", 2, h.vdrop)
 	srv.Register("vlist", 1, h.vlist)
 	srv.Register("vinfo", 2, h.vinfo)
-	srv.Register("vadd", -5, h.vadd) // VADD col id FP32 blob ...
+	srv.Register("vconfig", -3, h.vconfig) // VCONFIG col GET | SET k v ...
+	srv.Register("vadd", -5, h.vadd)       // VADD col id FP32 blob ...
 	srv.Register("vget", -3, h.vget)
 	srv.Register("vdel", -3, h.vdel)
 	srv.Register("vexists", 3, h.vexists)
@@ -47,6 +48,10 @@ const errSyntax = cmdError("syntax error")
 
 // writeErr maps an error to a RESP error reply.
 func writeErr(c *server.Conn, err error) {
+	if errors.Is(err, store.ErrOOM) { // Redis-style "-OOM ..." (error code OOM, not ERR)
+		c.W().WriteError(err.Error())
+		return
+	}
 	var ce cmdError
 	var cfg *store.ConfigError
 	var dim *store.DimMismatchError
@@ -61,7 +66,9 @@ func writeErr(c *server.Conn, err error) {
 		errors.Is(err, store.ErrCollectionNotFound),
 		errors.Is(err, store.ErrCollectionExists),
 		errors.Is(err, store.ErrZeroVector),
-		errors.Is(err, store.ErrNonFinite):
+		errors.Is(err, store.ErrNonFinite),
+		errors.Is(err, store.ErrMaxVectors),
+		errors.Is(err, store.ErrMaxCollections):
 		c.W().WriteError("ERR " + err.Error())
 	default:
 		c.W().WriteError("ERR internal error: " + err.Error())

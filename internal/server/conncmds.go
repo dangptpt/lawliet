@@ -183,6 +183,11 @@ func cmdInfo(c *Conn, args [][]byte) {
 		if !all && section != name {
 			return
 		}
+		for _, p := range s.info {
+			if p.section == name {
+				kv = append(kv, p.fn()...)
+			}
+		}
 		if buf.Len() > 0 {
 			buf.WriteString("\r\n")
 		}
@@ -210,22 +215,42 @@ func cmdInfo(c *Conn, args [][]byte) {
 	add("clients", [][2]string{
 		{"connected_clients", strconv.Itoa(s.ConnectedClients())},
 	})
+	mem := runtimeMemory()
 	add("memory", [][2]string{
-		{"used_memory_runtime", strconv.FormatUint(runtimeMemory(), 10)},
+		{"used_memory_runtime", strconv.FormatUint(mem.total, 10)},
+		{"used_memory_heap_live", strconv.FormatUint(mem.heapLive, 10)},
 	})
 	add("stats", [][2]string{
 		{"total_connections_received", strconv.FormatInt(s.stats.ConnectionsReceived.Load(), 10)},
 		{"total_commands_processed", strconv.FormatInt(s.stats.CommandsProcessed.Load(), 10)},
 	})
+	seen := map[string]bool{"server": true, "clients": true, "memory": true, "stats": true}
+	for _, p := range s.info {
+		if !seen[p.section] {
+			seen[p.section] = true
+			add(p.section, nil)
+		}
+	}
 	c.w.WriteBulkString(buf.String())
 }
 
-// runtimeMemory returns total bytes mapped by the Go runtime (cheap, no stop-the-world).
-func runtimeMemory() uint64 {
-	sample := []metrics.Sample{{Name: "/memory/classes/total:bytes"}}
-	metrics.Read(sample)
-	if sample[0].Value.Kind() != metrics.KindUint64 {
-		return 0
+type runtimeMem struct {
+	total    uint64 // all memory mapped by the Go runtime
+	heapLive uint64 // heap still in use after the last GC
+}
+
+// runtimeMemory reads Go runtime memory metrics (cheap, no stop-the-world).
+func runtimeMemory() runtimeMem {
+	samples := []metrics.Sample{
+		{Name: "/memory/classes/total:bytes"},
+		{Name: "/gc/heap/live:bytes"},
 	}
-	return sample[0].Value.Uint64()
+	metrics.Read(samples)
+	u := func(s metrics.Sample) uint64 {
+		if s.Value.Kind() != metrics.KindUint64 {
+			return 0
+		}
+		return s.Value.Uint64()
+	}
+	return runtimeMem{total: u(samples[0]), heapLive: u(samples[1])}
 }

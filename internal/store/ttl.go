@@ -151,15 +151,8 @@ func (c *Collection) expireRound() (sampled, removed int) {
 // Per collection it repeats rounds while more than 25% of a sample was expired.
 // Returns the number of records removed.
 func (s *Store) ExpireCycle(deadline time.Time) int {
-	s.mu.RLock()
-	cols := make([]*Collection, 0, len(s.collections))
-	for _, c := range s.collections {
-		cols = append(cols, c)
-	}
-	s.mu.RUnlock()
-
 	total := 0
-	for _, c := range cols {
+	for _, c := range s.collectionList() {
 		for {
 			sampled, removed := c.expireRound()
 			total += removed
