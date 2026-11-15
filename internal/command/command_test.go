@@ -13,7 +13,12 @@ import (
 
 func newClient(t *testing.T) *servertest.Client {
 	t.Helper()
-	addr := servertest.Start(t, func(s *server.Server) { Register(s, store.New()) })
+	return newClientWithStore(t, store.New())
+}
+
+func newClientWithStore(t *testing.T, st *store.Store) *servertest.Client {
+	t.Helper()
+	addr := servertest.Start(t, func(s *server.Server) { Register(s, st) })
 	return servertest.Dial(t, addr)
 }
 
@@ -39,7 +44,7 @@ func TestCollectionLifecycle(t *testing.T) {
 	want(t, c.Do("VLIST"), `*[$"docs" $"faq"]`)
 
 	want(t, c.Do("VINFO", "docs"),
-		`*[$"name" $"docs" $"dim" :3 $"metric" $"cosine" $"index" $"flat" $"count" :0 $"vector_bytes" :0]`)
+		`*[$"name" $"docs" $"dim" :3 $"metric" $"cosine" $"index" $"flat" $"count" :0 $"expires" :0 $"vector_bytes" :0]`)
 	want(t, c.Do("VINFO", "faq").Map()["metric"], `$"l2"`)
 
 	want(t, c.Do("VDROP", "faq"), ":1")
@@ -111,7 +116,6 @@ func TestRecordErrors(t *testing.T) {
 		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "META"}, "ERR syntax error"},
 		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "META", `{"a":{"b":1}}`}, "ERR invalid metadata: field 'a': nested object not allowed"},
 		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "META", `[1]`}, "ERR invalid metadata: must be a JSON object"},
-		{[]any{"VADD", "v", "a", "VALUES", 3, "1", "2", "3", "EX", 10}, "ERR syntax error"},
 		{[]any{"VADD", "v", "a", "VECTOR", "1"}, "ERR expected FP32 or VALUES, got 'VECTOR'"},
 		{[]any{"VGET", "v", "a", "BOGUS"}, "ERR syntax error"},
 	}
@@ -250,4 +254,13 @@ func TestSearchFilterAndFields(t *testing.T) {
 		`*[*[$"ops1" $"0.7" $"{\"page\":3,\"source\":\"ops.md\"}"]]`)
 	// Missing meta is null.
 	want(t, search("K", 1, "WITHTEXT", "WITHMETA"), `*[*[$"none" $"1" $"no meta" nil]]`)
+}
+
+func describe(v resp.Value) string { return servertest.Describe(v) }
+
+func expect(t *testing.T, got, want string) {
+	t.Helper()
+	if got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
 }

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/tranbaohieu/lawliet/internal/command"
 	"github.com/tranbaohieu/lawliet/internal/config"
@@ -40,8 +41,11 @@ func run(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	st := store.New()
+	go st.RunExpirer(ctx, 100*time.Millisecond)
+
 	srv := server.New(cfg.Addr(), logger)
-	command.Register(srv, store.New())
+	command.Register(srv, st)
 	if err := srv.ListenAndServe(ctx); err != nil {
 		logger.Error("server error", "err", err)
 		return 1

@@ -6,11 +6,12 @@ import (
 	"github.com/tranbaohieu/lawliet/internal/store"
 )
 
-// VADD <col> <id> (FP32 <blob> | VALUES <n> v...) [TEXT <str>] [META <json>] [NX | XX]
+// VADD <col> <id> (FP32 <blob> | VALUES <n> v...)
+//
+//	[TEXT <str>] [META <json>] [EX <sec> | PX <ms>] [NX | XX]
 //
 // Reply: 1 inserted, 0 updated, null if the NX/XX condition was not met.
-// An update replaces the whole record (text/meta not given are cleared).
-// EX/PX (M3) are not supported yet.
+// An update replaces the whole record (text, meta and TTL not given are cleared).
 func (h *handlers) vadd(c *server.Conn, args [][]byte) {
 	col, err := h.st.Get(string(args[1]))
 	if err != nil {
@@ -24,8 +25,19 @@ func (h *handlers) vadd(c *server.Conn, args [][]byte) {
 	}
 	rec := store.Record{Vector: vec}
 	mode := store.Upsert
+	var ttlMs int64 // 0 = no TTL
 	for ; i < len(args); i++ {
 		switch {
+		case (isKeyword(args[i], "EX") || isKeyword(args[i], "PX")) && i+1 < len(args) && ttlMs == 0:
+			unit := int64(1000)
+			if isKeyword(args[i], "PX") {
+				unit = 1
+			}
+			if ttlMs, err = parseExpire(args[i+1], unit); err != nil {
+				writeErr(c, err)
+				return
+			}
+			i++
 		case isKeyword(args[i], "TEXT") && i+1 < len(args):
 			rec.Text = string(args[i+1])
 			i++
@@ -45,6 +57,9 @@ func (h *handlers) vadd(c *server.Conn, args [][]byte) {
 		}
 	}
 
+	if ttlMs > 0 {
+		rec.ExpireAt = h.st.Now() + ttlMs
+	}
 	res, err := col.Add(string(args[2]), rec, mode)
 	if err != nil {
 		writeErr(c, err)

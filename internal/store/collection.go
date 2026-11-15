@@ -54,9 +54,10 @@ const (
 
 // Record is the content of one entry. Meta is treated as immutable once stored.
 type Record struct {
-	Vector []float32
-	Text   string
-	Meta   meta.Map // nil = no metadata
+	Vector   []float32
+	Text     string
+	Meta     meta.Map // nil = no metadata
+	ExpireAt int64    // absolute unix time in ms; 0 = no TTL
 }
 
 // SearchOptions controls Search.
@@ -82,7 +83,8 @@ type Result struct {
 type Info struct {
 	Name        string
 	Config      Config
-	Count       int
+	Count       int   // live records, including expired ones not yet reclaimed
+	Expires     int   // records with a TTL
 	Slots       int   // allocated slots, including tombstones
 	VectorBytes int64 // memory held by the vector slab
 }
@@ -92,29 +94,37 @@ type Info struct {
 // Records are addressed by a user-defined string ID mapped to an internal
 // uint32 slot. Per-slot data lives in parallel slices indexed by slot.
 // Deleted slots become tombstones and are reused through freeList.
+//
+// Expired records are invisible to every read immediately; their memory is
+// reclaimed lazily (on access) or by the active expiry cycle (see ttl.go).
 type Collection struct {
 	mu   sync.RWMutex
 	name string
 	cfg  Config
+	now  func() int64 // unix ms; injectable for tests
 
 	vectors  *VectorSlab
 	idToSlot map[string]uint32
 	slotToID []string
 	texts    []string
 	metas    []meta.Map
+	expireAt []int64
 	deleted  []bool
 	freeList []uint32
+	ttlSlots map[uint32]struct{} // slots with expireAt != 0
 	live     int
 
 	idx index.Index
 }
 
-func newCollection(name string, cfg Config) *Collection {
+func newCollection(name string, cfg Config, now func() int64) *Collection {
 	c := &Collection{
 		name:     name,
 		cfg:      cfg,
+		now:      now,
 		vectors:  NewVectorSlab(cfg.Dim),
 		idToSlot: make(map[string]uint32),
+		ttlSlots: make(map[uint32]struct{}),
 	}
 	c.idx = index.NewFlat(c, cfg.Metric)
 	return c
@@ -150,8 +160,18 @@ func (c *Collection) prepare(v []float32) ([]float32, error) {
 	return v, nil
 }
 
+// lookup returns the slot of a live, non-expired id. Caller must hold c.mu.
+func (c *Collection) lookup(id string, now int64) (slot uint32, ok, expired bool) {
+	slot, ok = c.idToSlot[id]
+	if ok && c.isExpired(slot, now) {
+		return slot, false, true
+	}
+	return slot, ok, false
+}
+
 // Add inserts or updates the record id according to mode.
-// An update replaces the whole record: text and metadata not given are cleared.
+// An update replaces the whole record: text, metadata and TTL not given are cleared.
+// An expired record counts as absent (NX succeeds, XX is skipped).
 func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error) {
 	v, err := c.prepare(rec.Vector)
 	if err != nil {
@@ -161,7 +181,11 @@ func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if slot, ok := c.idToSlot[id]; ok {
+	slot, ok, expired := c.lookup(id, c.now())
+	if expired {
+		c.removeSlot(id, slot)
+	}
+	if ok {
 		if mode == OnlyNew {
 			return Skipped, nil
 		}
@@ -169,6 +193,7 @@ func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error)
 		c.vectors.Set(slot, v)
 		c.texts[slot] = rec.Text
 		c.metas[slot] = rec.Meta
+		c.setExpire(slot, rec.ExpireAt)
 		c.idx.Add(slot, v)
 		return Updated, nil
 	}
@@ -176,7 +201,6 @@ func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error)
 		return Skipped, nil
 	}
 
-	var slot uint32
 	if n := len(c.freeList); n > 0 {
 		slot = c.freeList[n-1]
 		c.freeList = c.freeList[:n-1]
@@ -189,8 +213,10 @@ func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error)
 		c.slotToID = append(c.slotToID, id)
 		c.texts = append(c.texts, rec.Text)
 		c.metas = append(c.metas, rec.Meta)
+		c.expireAt = append(c.expireAt, 0)
 		c.deleted = append(c.deleted, false)
 	}
+	c.setExpire(slot, rec.ExpireAt)
 	c.vectors.Set(slot, v)
 	c.idToSlot[id] = slot
 	c.live++
@@ -198,53 +224,73 @@ func (c *Collection) Add(id string, rec Record, mode AddMode) (AddResult, error)
 	return Inserted, nil
 }
 
-// Get returns the record. The vector is a copy (normalized for cosine).
-func (c *Collection) Get(id string) (Record, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	slot, ok := c.idToSlot[id]
-	if !ok {
-		return Record{}, false
-	}
-	return Record{
-		Vector: slices.Clone(c.vectors.Get(slot)),
-		Text:   c.texts[slot],
-		Meta:   c.metas[slot],
-	}, true
+// removeSlot deletes a record. Caller must hold c.mu for writing.
+func (c *Collection) removeSlot(id string, slot uint32) {
+	c.idx.Remove(slot)
+	delete(c.idToSlot, id)
+	c.slotToID[slot] = ""
+	c.texts[slot] = "" // release memory to the GC
+	c.metas[slot] = nil
+	c.setExpire(slot, 0)
+	c.deleted[slot] = true
+	c.freeList = append(c.freeList, slot)
+	c.live--
 }
 
-// Exists reports whether id is present.
-func (c *Collection) Exists(id string) bool {
+// Get returns the record. The vector is a copy (normalized for cosine).
+func (c *Collection) Get(id string) (Record, bool) {
+	now := c.now()
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-	_, ok := c.idToSlot[id]
+	slot, ok, expired := c.lookup(id, now)
+	if !ok {
+		c.mu.RUnlock()
+		if expired {
+			c.reclaim(id)
+		}
+		return Record{}, false
+	}
+	rec := Record{
+		Vector:   slices.Clone(c.vectors.Get(slot)),
+		Text:     c.texts[slot],
+		Meta:     c.metas[slot],
+		ExpireAt: c.expireAt[slot],
+	}
+	c.mu.RUnlock()
+	return rec, true
+}
+
+// Exists reports whether id is present and not expired.
+func (c *Collection) Exists(id string) bool {
+	now := c.now()
+	c.mu.RLock()
+	_, ok, expired := c.lookup(id, now)
+	c.mu.RUnlock()
+	if expired {
+		c.reclaim(id)
+	}
 	return ok
 }
 
-// Delete removes the given IDs and returns how many existed.
+// Delete removes the given IDs and returns how many existed (expired ones do not count).
 func (c *Collection) Delete(ids ...string) int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := c.now()
 	n := 0
 	for _, id := range ids {
-		slot, ok := c.idToSlot[id]
-		if !ok {
-			continue
+		slot, ok, expired := c.lookup(id, now)
+		if ok || expired {
+			c.removeSlot(id, slot)
 		}
-		c.idx.Remove(slot)
-		delete(c.idToSlot, id)
-		c.slotToID[slot] = ""
-		c.texts[slot] = "" // release memory to the GC
-		c.metas[slot] = nil
-		c.deleted[slot] = true
-		c.freeList = append(c.freeList, slot)
-		c.live--
-		n++
+		if ok {
+			n++
+		}
 	}
 	return n
 }
 
-// Count returns the number of live records.
+// Count returns the number of records, including expired ones not yet
+// reclaimed (same as Redis DBSIZE). The active expiry cycle keeps it close.
 func (c *Collection) Count() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -252,20 +298,26 @@ func (c *Collection) Count() int {
 }
 
 // Search returns up to opt.K records most similar to query, best first.
-// The filter runs before the distance computation, so filtered-out records cost
-// only a metadata check.
+// Deleted and expired records are skipped; the filter runs before the distance
+// computation, so filtered-out records cost only a metadata check.
 func (c *Collection) Search(query []float32, opt SearchOptions) ([]Result, error) {
 	q, err := c.prepare(query)
 	if err != nil {
 		return nil, err
 	}
+	now := c.now()
 
 	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	accept := func(slot uint32) bool { return !c.deleted[slot] }
-	if opt.Filter != nil {
-		accept = func(slot uint32) bool { return !c.deleted[slot] && opt.Filter(c.metas[slot]) }
+	var expired []uint32 // seen during the scan; reclaimed after releasing the read lock
+	accept := func(slot uint32) bool {
+		if c.deleted[slot] {
+			return false
+		}
+		if c.isExpired(slot, now) {
+			expired = append(expired, slot)
+			return false
+		}
+		return opt.Filter == nil || opt.Filter(c.metas[slot])
 	}
 
 	hits := c.idx.Search(q, opt.K, accept)
@@ -283,6 +335,11 @@ func (c *Collection) Search(query []float32, opt SearchOptions) ([]Result, error
 		}
 		out[i] = r
 	}
+	c.mu.RUnlock()
+
+	if len(expired) > 0 {
+		c.reclaimSlots(expired)
+	}
 	return out, nil
 }
 
@@ -294,6 +351,7 @@ func (c *Collection) Info() Info {
 		Name:        c.name,
 		Config:      c.cfg,
 		Count:       c.live,
+		Expires:     len(c.ttlSlots),
 		Slots:       len(c.slotToID),
 		VectorBytes: c.vectors.Bytes(),
 	}

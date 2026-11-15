@@ -254,7 +254,7 @@ VCONFIG <col> SET POLICY <p>                                            → +OK
 VCONFIG <col> SET MAX_VECTORS <n>                                       → +OK
 ```
 
-`VINFO` reply is a map (flat array in RESP2). Fields: `name, dim, metric, index, count, vector_bytes`;
+`VINFO` reply is a map (flat array in RESP2). Fields: `name, dim, metric, index, count, expires, vector_bytes`;
 `max_vectors`, `policy` and `memory_bytes` are added in M4.
 
 ### 5.2 Records
@@ -280,6 +280,14 @@ VEXPIRE  <col> <id> <sec>   → :1 | :0
 VTTL     <col> <id>         → seconds | -1 (no TTL) | -2 (not found)
 VPERSIST <col> <id>         → :1 | :0
 ```
+
+- `EX`/`PX` on `VADD` must be positive; TTLs are capped at ~100 years (`-ERR invalid expire time`).
+  `EX` and `PX` together → syntax error.
+- `VEXPIRE` with a value ≤ 0 deletes the record immediately and returns 1 (same as Redis `EXPIRE`).
+- `VTTL` rounds the remaining time to the nearest second, like Redis `TTL`.
+- `VPERSIST` returns 0 if the record has no TTL.
+- An expired record behaves as missing for every command (`NX` inserts, `XX` skips,
+  `VDEL` counts 0, `VEXPIRE`/`VPERSIST` return 0).
 
 ### 5.4 Search
 
@@ -438,10 +446,21 @@ Never call `freeMemory` while holding a collection lock (deadlock risk).
 
 ## 9. TTL Expiry
 
-- **Lazy**: any read/search touching an expired record skips it and deletes it.
-- **Active**: every 100 ms, for each collection with TTL records, sample up to 20 slots
-  from `ttlSlots`, delete expired ones; repeat while > 25% of the sample was expired
-  (bounded time budget per tick).
+TTLs are stored as absolute unix milliseconds per slot (`expireAt`); `ttlSlots` holds the
+slots that have one.
+
+- **Visibility**: a record is expired as soon as `now >= expireAt`. Every read (`VGET`,
+  `VEXISTS`, `VTTL`, `VSEARCH`) and write treats it as missing immediately.
+- **Lazy reclaim**: reads hold only the read lock, so they note expired records and delete
+  them right after releasing it (re-checking expiry under the write lock).
+- **Active reclaim**: a background goroutine runs every 100 ms. For each collection it
+  samples up to 20 entries of `ttlSlots` (Go map iteration order is randomized, which gives
+  a cheap sample), deletes the expired ones, and repeats while > 25% of the sample was
+  expired. Each cycle may use at most 25 ms. A small residue of expired records can remain
+  after one cycle; later cycles or reads reclaim it.
+- **Counts**: `VCOUNT` / `VINFO count` include expired records not yet reclaimed, like
+  Redis `DBSIZE`. The active cycle keeps the difference small.
+- The clock is injectable (`Store.SetClock`) so tests do not sleep.
 
 ---
 
@@ -548,6 +567,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | `-ERR vector contains NaN or Inf`                            | non-finite value              |
 | `-ERR K must be an integer between 1 and 10000`              | bad `K`                       |
 | `-ERR invalid metadata: <reason>`                            | bad `META` JSON               |
+| `-ERR invalid expire time`                                   | bad `EX`/`PX`/`VEXPIRE` value |
 | `-ERR invalid filter: <reason> at position <n>`              | bad `FILTER` expression       |
 | `-ERR max_vectors reached`                                   | limit hit with `noeviction`   |
 | `-OOM command not allowed when used memory > 'maxmemory'`    | memory limit, cannot evict    |
@@ -565,7 +585,7 @@ Bad magic / version / CRC → refuse to start with a clear error.
 | **M0** Skeleton ✅ | RESP2/RESP3 parser/writer, TCP server, courtesy commands | `redis-cli -p 6380 ping` → `PONG`; `redis-py` connects with default settings |
 | **M1** Core vectors ✅ | Collections, slab, `VADD/VGET/VDEL/VEXISTS/VCOUNT`, `VALUES`/`FP32`, Flat `VSEARCH` (no filter) | Python script inserts 10k vectors and gets correct top-K vs NumPy |
 | **M2** Metadata & filter ✅ | `TEXT`, `META`, filter lexer/parser/evaluator, `WITH*` flags | Filter unit tests incl. `and/or/not/()`, `in`, `contains` |
-| **M3** TTL | `EX/PX`, `VEXPIRE/VTTL/VPERSIST`, lazy + active expiry | Records disappear after TTL; `VTTL` matches Redis semantics |
+| **M3** TTL ✅ | `EX/PX`, `VEXPIRE/VTTL/VPERSIST`, lazy + active expiry | Records disappear after TTL; `VTTL` matches Redis semantics |
 | **M4** Limits & eviction | MemTracker, `maxmemory`, `max_vectors`, 3 policies, `VCONFIG`, `VINFO`, `INFO` | Eviction tests per policy; `noeviction` returns errors |
 | **M5** Snapshot | `.lwdb` writer/reader, save rules, `SAVE`, shutdown save, startup load | Restart restores identical search results; corrupt file detected |
 | **M6** Release | README quickstart, Python RAG example, Dockerfile, GitHub Actions CI, benchmark script | `docker run` + example works end-to-end |

@@ -77,7 +77,7 @@ func (h *handlers) vinfo(c *server.Conn, args [][]byte) {
 	}
 	info := col.Info()
 	w := c.W()
-	w.WriteMapHeader(6)
+	w.WriteMapHeader(7)
 	w.WriteBulkString("name")
 	w.WriteBulkString(info.Name)
 	w.WriteBulkString("dim")
@@ -88,6 +88,8 @@ func (h *handlers) vinfo(c *server.Conn, args [][]byte) {
 	w.WriteBulkString(info.Config.Index)
 	w.WriteBulkString("count")
 	w.WriteInt(int64(info.Count))
+	w.WriteBulkString("expires")
+	w.WriteInt(int64(info.Expires))
 	w.WriteBulkString("vector_bytes")
 	w.WriteInt(info.VectorBytes)
 }
