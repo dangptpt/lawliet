@@ -22,7 +22,7 @@ hits = r.execute_command("VSEARCH", "docs", "FP32", embedding.astype("<f4").toby
 # [[b'doc:1', 0.99999976, b'Employees get 12 days of paid leave.']]  (float32 rounding)
 ```
 
-> **Status:** MVP (milestones M0–M6 done). Exact (flat) search only; see
+> **Status:** v0.2.0 — MVP plus semantic cache commands (`VCACHE.*`). Exact (flat) search only; see
 > [Limitations](#limitations).
 
 ## Why
@@ -45,6 +45,21 @@ clients work unchanged, and adds the features a RAG prototype needs:
 - **Optional snapshots** to one local file, restored bit-exact on restart.
 
 ## Quick start
+
+### Download a binary
+
+Prebuilt binaries for macOS, Linux and Windows are on the
+[Releases](https://github.com/tranbaohieu/lawliet/releases) page — one file, nothing else to install.
+
+```bash
+# macOS Apple Silicon. Other builds: darwin_amd64, linux_amd64, linux_arm64, windows_amd64 (.zip)
+curl -L https://github.com/tranbaohieu/lawliet/releases/latest/download/lawliet_darwin_arm64.tar.gz | tar xz
+./lawliet_darwin_arm64/lawliet --version
+./lawliet_darwin_arm64/lawliet          # listening on 127.0.0.1:6380
+```
+
+`checksums.txt` in each release lists SHA-256 sums. If macOS blocks a binary downloaded with a
+browser, remove the quarantine flag: `xattr -d com.apple.quarantine lawliet`.
 
 ### From source (Go 1.27.4+)
 

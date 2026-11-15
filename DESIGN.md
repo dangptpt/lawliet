@@ -106,6 +106,7 @@ lawliet/
 ├── scripts/e2e/               # end-to-end checks; run_all.sh runs them all
 ├── scripts/bench/             # end-to-end benchmark
 ├── .github/workflows/ci.yml   # gofmt, vet, race tests, e2e, docker build + smoke test
+├── .github/workflows/release.yml # on tag v*: test, build 5 OS/arch binaries, GitHub Release
 ├── Dockerfile                 # distroless, non-root, listens on 0.0.0.0 in the container
 ├── DESIGN.md
 ├── README.md
