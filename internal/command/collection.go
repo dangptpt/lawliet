@@ -9,12 +9,16 @@ import (
 	"github.com/tranbaohieu/lawliet/internal/store"
 )
 
-// VCREATE <col> DIM <n> [METRIC cosine|l2|ip] [INDEX flat]
+// VCREATE <col> DIM <n> [METRIC cosine|l2|ip] [INDEX flat|hnsw|ivf]
 //
+//	[M <n>] [EF_CONSTRUCTION <n>] [EF_SEARCH <n>]            (hnsw)
+//	[NLIST <n>] [NPROBE <n>]                                 (ivf)
+//	[QUANT none|sq8|pq] [PQ_M <n>] [RERANK <n>]              (flat, ivf)
 //	[MAX_VECTORS <n>] [POLICY noeviction|allkeys-lru|volatile-ttl]
 //	[CACHE_THRESHOLD <score>] [CACHE_TTL <sec>]
 //
 // POLICY defaults to the server's --maxmemory-policy. CACHE_* are defaults for VCACHE.*.
+// Index options are validated against the index kind (DESIGN.md §7.1).
 func (h *handlers) vcreate(c *server.Conn, args [][]byte) {
 	cfg := store.Config{Metric: index.Cosine, Index: "flat", Policy: h.st.Limits().DefaultPolicy}
 	for i := 2; i < len(args); i += 2 {
@@ -40,6 +44,21 @@ func (h *handlers) vcreate(c *server.Conn, args [][]byte) {
 			cfg.Metric = m
 		case isKeyword(args[i], "INDEX"):
 			cfg.Index = strings.ToLower(string(val))
+		case isKeyword(args[i], "QUANT"):
+			q, err := index.ParseQuant(string(val))
+			if err != nil {
+				writeErr(c, cmdError(err.Error()))
+				return
+			}
+			cfg.IndexOpts.Quant = q
+		case indexIntOption(&cfg.IndexOpts, args[i]) != nil:
+			name := strings.ToUpper(string(args[i]))
+			n, err := parseInt(val, name, 1, index.MaxNList)
+			if err != nil {
+				writeErr(c, err)
+				return
+			}
+			*indexIntOption(&cfg.IndexOpts, args[i]) = n
 		case isKeyword(args[i], "MAX_VECTORS"):
 			n, err := parseInt(val, "MAX_VECTORS", 0, store.MaxVectorsLimit)
 			if err != nil {
@@ -111,7 +130,7 @@ func (h *handlers) vinfo(c *server.Conn, args [][]byte) {
 	}
 	info := col.Info()
 	w := c.W()
-	w.WriteMapHeader(12)
+	w.WriteMapHeader(15)
 	w.WriteBulkString("name")
 	w.WriteBulkString(info.Name)
 	w.WriteBulkString("dim")
@@ -120,6 +139,12 @@ func (h *handlers) vinfo(c *server.Conn, args [][]byte) {
 	w.WriteBulkString(info.Config.Metric.String())
 	w.WriteBulkString("index")
 	w.WriteBulkString(info.Config.Index)
+	w.WriteBulkString("index_params")
+	w.WriteBulkString(index.Describe(info.Config.Index, info.Config.Dim, info.Config.IndexOpts))
+	w.WriteBulkString("index_state")
+	w.WriteBulkString(info.IndexStats.State)
+	w.WriteBulkString("index_bytes")
+	w.WriteInt(info.IndexStats.Bytes)
 	w.WriteBulkString("count")
 	w.WriteInt(int64(info.Count))
 	w.WriteBulkString("expires")
@@ -239,4 +264,17 @@ func writeCacheConfig(c *server.Conn, cfg store.Config) {
 	}
 	w.WriteBulkString("cache_ttl")
 	w.WriteInt(cfg.CacheTTL)
+}
+
+// indexIntOption returns the integer index option named kw, or nil.
+func indexIntOption(o *index.Options, kw []byte) *int {
+	for name, p := range map[string]*int{
+		"M": &o.M, "EF_CONSTRUCTION": &o.EfConstruction, "EF_SEARCH": &o.EfSearch,
+		"NLIST": &o.NList, "NPROBE": &o.NProbe, "PQ_M": &o.PQM, "RERANK": &o.Rerank,
+	} {
+		if isKeyword(kw, name) {
+			return p
+		}
+	}
+	return nil
 }

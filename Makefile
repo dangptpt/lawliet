@@ -1,6 +1,9 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -X github.com/tranbaohieu/lawliet/internal/version.Version=$(VERSION)
 PYTHON  ?= python3
+# AVX2 distance kernels (internal/vecmath/simd_amd64.go); without it the scalar
+# fallback is built. Override with GOEXPERIMENT= to build without SIMD.
+export GOEXPERIMENT ?= simd
 
 .PHONY: build run test race vet fmt fmt-check e2e bench docker py-wheel py-test clean
 

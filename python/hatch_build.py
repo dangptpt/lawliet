@@ -102,7 +102,7 @@ class CustomBuildHook(BuildHookInterface):
         if go is None:
             raise RuntimeError("go not found on PATH: install Go or set LAWLIET_BINARY")
         goos, goarch = target.split("/")
-        env = {**os.environ, "CGO_ENABLED": "0", "GOOS": goos, "GOARCH": goarch}
+        env = {**os.environ, "CGO_ENABLED": "0", "GOOS": goos, "GOARCH": goarch, "GOEXPERIMENT": "simd"}
         ldflags = f"-s -w -X {_VERSION_VAR}=v{self.metadata.version}"
         subprocess.run(
             [go, "build", "-trimpath", "-ldflags", ldflags, "-o", str(out), "./cmd/lawliet"],

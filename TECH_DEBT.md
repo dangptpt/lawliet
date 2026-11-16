@@ -62,3 +62,61 @@ memory-constrained deployments.
 
 With `--maxmemory X`, `used_memory_heap_live` stays within a documented bound
 of X (e.g. ≤ 1.2·X) in `scripts/e2e/m4_limits.py`.
+
+---
+
+## TD-2: IVF / PQ training blocks a write
+
+- **Recorded:** 2026-11-16 (ANN spike)
+- **Status:** open
+- **Design reference:** DESIGN.md §7.4, §16.3
+
+### Problem
+
+IVF trains (k-means, PQ codebooks) inside the `VADD` that crosses a training threshold, under the
+collection write lock. Measured at 100k × 1024 (`docs/benchmarks/ann-2026-11-16`): the slowest
+single insert takes 3.8 s (IVF-Flat), 5.3 s (IVF-SQ8), 12.6 s (IVF-PQ). Searches on that
+collection wait as well. With the AVX2 kernels: 0.9 s, 1.4 s, 9.6 s (PQ training runs on
+16-dim sub-vectors, which stay on the scalar path).
+
+### Fix options
+
+1. Train on a snapshot of the sample in a background goroutine; keep serving with the old
+   centroids (or exact search) and swap under a short write lock, re-assigning records added
+   meanwhile.
+2. Mini-batch / e-means updates (DESIGN §16.3) to make retraining incremental.
+3. Parallelize Lloyd iterations further (assignment already is) and use SIMD dot products.
+
+### Done when
+
+No single `VADD` exceeds 50 ms while an IVF collection grows from 0 to 100k records.
+
+---
+
+## TD-3: HNSW quality degrades under churn
+
+- **Recorded:** 2026-11-16 (ANN spike)
+- **Status:** partly fixed 2026-11-16 — deletes repair neighbors (fix option 1): after 3 × 30%
+  churn recall@10 is 0.971 instead of 0.954 (fresh build 0.979). Not yet within the 0.005 target;
+  the repaired graph has 8% fewer links. Next: refill pruned links up to M (keep pruned
+  connections) or option 2.
+- **Design reference:** DESIGN.md §7.3, §16.3
+
+### Problem
+
+Deletes are tombstones and a reused slot is re-inserted with new links, but links from other
+nodes to the old vector stay. After deleting and re-inserting 30% of records three times,
+recall@10 at ef=64 falls 0.979 → 0.954 and the graph loses 8% of its links
+(`docs/benchmarks/ann-2026-11-16`). TTL expiry and LRU eviction in a semantic cache cause
+exactly this pattern.
+
+### Fix options
+
+1. On delete, repair neighbors of the removed node (connect them to each other with the
+   heuristic), as hnswlib's `markDelete` + replace does.
+2. Rebuild the graph in the background when the share of replaced nodes since the last build
+   exceeds a threshold (e.g. 30%), swapping atomically.
+
+### Done when
+
+Recall after 3 × 30% churn stays within 0.005 of the fresh build in the benchmark.

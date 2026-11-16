@@ -5,7 +5,7 @@ FROM golang:1.27-alpine AS build
 WORKDIR /src
 COPY . .
 ARG VERSION=dev
-RUN CGO_ENABLED=0 go build -trimpath \
+RUN CGO_ENABLED=0 GOEXPERIMENT=simd go build -trimpath \
       -ldflags "-s -w -X github.com/tranbaohieu/lawliet/internal/version.Version=${VERSION}" \
       -o /out/lawliet ./cmd/lawliet \
  && mkdir -p /out/data
