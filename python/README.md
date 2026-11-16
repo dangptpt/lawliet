@@ -5,8 +5,11 @@ package. The wheel contains the server binary: `pip install`, start it from Pyth
 talk to it with `redis-py`. No Docker, no separate download.
 
 ```bash
-pip install lawliet
+pip install lawliet-server
 ```
+
+The import name is `lawliet`. Do not install it next to the unrelated `lawliet` package on
+PyPI (a web framework): both provide a `lawliet` module.
 
 ```python
 import lawliet

@@ -6,7 +6,7 @@ real model (OpenAI, sentence-transformers, Ollama, ...) and `generate()` with
 your LLM call for real use; nothing else changes.
 
 Usage, with the Python package (server started by the script, nothing else to run):
-    pip install lawliet numpy
+    pip install lawliet-server numpy
     python examples/python/rag_demo.py
 
 or against a server you started yourself on port 6380:

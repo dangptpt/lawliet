@@ -52,7 +52,7 @@ The [`lawliet` Python package](python/README.md) bundles the server binary: inst
 start the server from your script, notebook or test — nothing else to download or run.
 
 ```bash
-pip install lawliet
+pip install lawliet-server        # import lawliet
 ```
 
 ```python
@@ -69,7 +69,7 @@ with lawliet.server() as r:          # fresh in-memory server for one block (e.g
 
 Wheels are built for the same platforms as the binaries below and attached to each
 [release](https://github.com/tranbaohieu/lawliet/releases) from the release after v0.2.0
-on; `pip install lawliet` works once they are published to PyPI. The package also installs a
+on; `pip install lawliet-server` works once they are published to PyPI. The package also installs a
 `lawliet` command (`lawliet --port 6380`).
 
 ### Download a binary

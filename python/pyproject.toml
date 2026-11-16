@@ -3,7 +3,8 @@ requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
-name = "lawliet"
+name = "lawliet-server"
+# Import name stays `lawliet`. "lawliet" on PyPI is an unrelated web framework.
 dynamic = ["version"]
 description = "In-memory vector cache that speaks the Redis protocol. pip install, then start it from Python."
 readme = "README.md"
@@ -11,7 +12,7 @@ license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.9"
 dependencies = ["redis>=5"]
-keywords = ["vector", "vector-database", "semantic-cache", "rag", "llm", "redis"]
+keywords = ["vector", "vector-search", "vector-database", "semantic-cache", "rag", "llm", "redis", "embeddings"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

@@ -44,7 +44,7 @@ def binary_path() -> str:
     if not path.is_file():
         raise LawlietError(
             f"lawliet server binary not found at {path}. Install a platform wheel "
-            "(pip install lawliet), or set LAWLIET_BINARY to a lawliet binary."
+            "(pip install lawliet-server), or set LAWLIET_BINARY to a lawliet binary."
         )
     if os.name != "nt" and not os.access(path, os.X_OK):
         try:
