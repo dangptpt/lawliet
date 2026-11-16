@@ -46,13 +46,50 @@ jobs:
               tar -C build -czf "dist/$name.tar.gz" "$name"
             fi
           done
-          (cd dist && sha256sum * > checksums.txt)
           ls -l dist
 
       - name: smoke test linux/amd64 binary
         run: |
           tar -xzf dist/lawliet_linux_amd64.tar.gz -C /tmp
           /tmp/lawliet_linux_amd64/lawliet --version | tee /dev/stderr | grep -q "${GITHUB_REF_NAME}"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # One wheel per target with the binary built above (python/hatch_build.py).
+      - name: build Python wheels
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          echo "__version__ = \"${TAG#v}\"" > python/src/lawliet/_version.py
+          python -m pip install build
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64; do
+            os=${target%/*}; arch=${target#*/}
+            bin="lawliet"; [ "$os" = windows ] && bin="lawliet.exe"
+            LAWLIET_TARGET=$target LAWLIET_BINARY="build/lawliet_${os}_${arch}/$bin" \
+              python -m build --wheel --outdir dist-python python
+          done
+          ls -l dist-python
+
+      - name: smoke test linux/amd64 wheel
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install dist-python/*manylinux*_x86_64*.whl
+          /tmp/venv/bin/lawliet --version | tee /dev/stderr | grep -q "${GITHUB_REF_NAME}"
+          /tmp/venv/bin/python -c "import lawliet; r = lawliet.start(); assert r.ping(); lawliet.stop()"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-wheels
+          path: dist-python/*.whl
+
+      - name: checksums
+        run: |
+          cp dist-python/*.whl dist/
+          (cd dist && sha256sum * > checksums.txt)
+          cat dist/checksums.txt
 
       - name: publish release
         env:
@@ -67,3 +104,20 @@ jobs:
             git tag -l --format='%(contents)' "$TAG" > notes.md
           fi
           gh release create "$TAG" dist/* --title "Lawliet $TAG" --notes-file notes.md --verify-tag
+
+  # Publishes the wheels to PyPI with trusted publishing (no token stored in GitHub).
+  # Off until the repository variable PYPI_PUBLISH is "true"; first configure a trusted
+  # publisher on pypi.org for this repository, workflow release.yml, environment "pypi".
+  pypi:
+    needs: release
+    if: vars.PYPI_PUBLISH == 'true'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: python-wheels
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
