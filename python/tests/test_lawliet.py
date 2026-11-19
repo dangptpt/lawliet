@@ -7,6 +7,8 @@ import os
 import socket
 import subprocess
 import sys
+import threading
+import time
 
 import pytest
 
@@ -97,3 +99,41 @@ def test_cli_version():
         capture_output=True, text=True, check=True,
     ).stdout
     assert out.startswith("lawliet ")
+
+
+@pytest.mark.parametrize("how", ["terminate", "kill"])
+def test_server_stops_when_parent_dies(how):
+    # SIGTERM / SIGKILL skip atexit: the closed stdin pipe must stop the server.
+    script = "import lawliet, time; s = lawliet.Server().start(); print(s.port, flush=True); time.sleep(60)"
+    parent = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE)
+    try:
+        port = int(parent.stdout.readline())
+        assert not port_closed(port)
+    finally:
+        getattr(parent, how)()
+        parent.wait()
+        parent.stdout.close()
+    deadline = time.monotonic() + 10
+    while not port_closed(port):
+        assert time.monotonic() < deadline, "server outlived its parent process"
+        time.sleep(0.05)
+
+
+def test_start_is_thread_safe():
+    errors, clients = [], []
+
+    def run():
+        try:
+            clients.append(lawliet.start())
+        except LawlietError as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=run) for _ in range(4)]
+    try:
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert len(clients) == 1 and len(errors) == 3
+    finally:
+        lawliet.stop()

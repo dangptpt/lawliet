@@ -18,6 +18,7 @@ Commands (VADD, VSEARCH, VCACHE.*, ...) are documented in the project README.
 from __future__ import annotations
 
 import contextlib
+import threading
 from typing import TYPE_CHECKING, Any, Iterator
 
 from ._server import LawlietError, Server, binary_path
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 __all__ = ["LawlietError", "Server", "binary_path", "server", "start", "stop", "__version__"]
 
 _default: Server | None = None
+_lock = threading.Lock()  # start() / stop() from several threads
 
 
 def start(port: int | None = None, **options: Any) -> redis.Redis:
@@ -39,18 +41,20 @@ def start(port: int | None = None, **options: Any) -> redis.Redis:
     way; use :class:`Server` directly for more.
     """
     global _default
-    if _default is not None and _default.running:
-        raise LawlietError(f"already started ({_default!r}); call lawliet.stop() first")
-    _default = Server(port, **options).start()
-    return _default.client()
+    with _lock:
+        if _default is not None and _default.running:
+            raise LawlietError(f"already started ({_default!r}); call lawliet.stop() first")
+        _default = Server(port, **options).start()
+        return _default.client()
 
 
 def stop() -> None:
     """Stop the server started by :func:`start`, if any."""
     global _default
-    if _default is not None:
-        _default.stop()
-        _default = None
+    with _lock:
+        if _default is not None:
+            _default.stop()
+            _default = None
 
 
 @contextlib.contextmanager

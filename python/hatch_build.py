@@ -4,7 +4,10 @@ Environment variables:
 
     LAWLIET_TARGET   GOOS/GOARCH the wheel is for, e.g. linux/arm64.
                      Default: this machine.
-    LAWLIET_BINARY   Prebuilt lawliet binary for that target.
+    LAWLIET_BINARY   Prebuilt lawliet binary for that target. A relative path is
+                     resolved against the repository root (the parent of this
+                     directory), not the working directory: build frontends
+                     run this hook from python/.
                      Default: build it with `go build` from the repository
                      (needs Go and the Go sources next to this directory).
 
@@ -70,8 +73,12 @@ class CustomBuildHook(BuildHookInterface):
         staged = self._staging / exe
         prebuilt = os.environ.get("LAWLIET_BINARY")
         if prebuilt:
-            if not Path(prebuilt).is_file():
-                raise FileNotFoundError(f"LAWLIET_BINARY={prebuilt!r} is not a file")
+            path = Path(prebuilt)
+            if not path.is_absolute():
+                path = Path(self.root).parent / path
+            if not path.is_file():
+                raise FileNotFoundError(f"LAWLIET_BINARY={prebuilt!r}: {path} is not a file")
+            prebuilt = str(path)
             shutil.copyfile(prebuilt, staged)
         else:
             self._go_build(target, staged)

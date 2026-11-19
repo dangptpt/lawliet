@@ -65,8 +65,11 @@ python -m lawliet --version
 ## Notes
 
 - Wheels: macOS 12+ (arm64, x86_64), Linux (x86_64, aarch64; glibc and musl), Windows (x86_64).
-- `LAWLIET_BINARY=/path/to/lawliet` makes the package use another server binary.
-- On Windows `stop()` kills the process, so no snapshot is written on stop; call `SAVE` first.
+- `LAWLIET_BINARY=/path/to/lawliet` makes the package use another server binary (it must
+  support `--exit-on-stdin-eof`, i.e. be from the same release or newer).
+- The server never outlives the Python process: it watches a pipe on its stdin and shuts down
+  when the pipe closes, also when Python is killed (SIGTERM, SIGKILL, Jupyter kernel restart).
+  `stop()` and normal exit shut it down gracefully on every platform (snapshot written).
 - There is no authentication: keep the default `host="127.0.0.1"`.
 
 Commands (`VSEARCH`, `VCACHE.*`, filters, TTL, eviction), limitations and design:

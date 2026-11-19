@@ -166,8 +166,10 @@ Details — reply formats, filter grammar, errors — are in [DESIGN.md](DESIGN.
 | `--dir` | empty (off) | enable snapshots in this existing directory |
 | `--dbfilename` | `dump.lwdb` | |
 | `--save "sec changes"` | `3600 1`, `300 100`, `60 10000` | repeatable; `--save ""` disables auto-save |
+| `--exit-on-stdin-eof` | off | shut down when stdin closes (used by the Python package) |
 
-Snapshots are written on save rules, on `SAVE`, and on shutdown (`SIGINT`/`SIGTERM`),
+Snapshots are written on save rules, on `SAVE`, and on shutdown (`SIGINT`/`SIGTERM`, or stdin
+closed with `--exit-on-stdin-eof`),
 and loaded at startup. A corrupt file stops the server instead of loading partial data.
 
 ## Performance

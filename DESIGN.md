@@ -676,6 +676,7 @@ defaults; `internal/snapshot/testdata/v1.lwdb` guards this).
 | `--dir`               | empty → persistence off |
 | `--dbfilename`        | `dump.lwdb`    |
 | `--save`              | see §10.1      |
+| `--exit-on-stdin-eof` | off: when set, graceful shutdown once stdin reaches EOF (parent process gone; used by `python/`) |
 
 ---
 

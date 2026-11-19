@@ -65,6 +65,14 @@ jobs:
         run: |
           python -m pip install python/dist/*.whl
           cd python && python -m pytest -q tests
+      # The release path: prebuilt binary through LAWLIET_BINARY, relative to the repo root.
+      - name: wheel from a prebuilt binary (release path)
+        if: runner.os == 'Linux'
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -o build/lawliet_linux_arm64/lawliet ./cmd/lawliet
+          LAWLIET_TARGET=linux/arm64 LAWLIET_BINARY=build/lawliet_linux_arm64/lawliet \
+            python -m build --wheel --outdir dist-release python
+          python -m zipfile -l dist-release/*manylinux_2_17_aarch64*.whl | grep -q "lawliet/bin/lawliet"
 
   docker:
     needs: test

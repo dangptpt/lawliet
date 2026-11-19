@@ -110,8 +110,12 @@ def connect() -> redis.Redis:
     try:
         import lawliet
     except ImportError:
+        print("lawliet package not installed: using the server on localhost:6380")
         return redis.Redis(port=6380)
-    return lawliet.start()  # stopped automatically when the script exits
+    r = lawliet.start()  # stopped automatically when the script exits
+    host, port = r.connection_pool.connection_kwargs["host"], r.connection_pool.connection_kwargs["port"]
+    print(f"using a server started by the lawliet package on {host}:{port} (not localhost:6380)")
+    return r
 
 
 def main() -> None:

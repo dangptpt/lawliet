@@ -59,7 +59,13 @@ class Server:
 
     ``port=None`` picks a free port. Without ``data_dir`` everything stays in
     memory and is gone after ``stop()``; with it, snapshots are loaded at start
-    and written on ``stop()`` (graceful shutdown on macOS and Linux only).
+    and written on ``stop()``.
+
+    The server's stdin is a pipe held by this process and the server runs with
+    ``--exit-on-stdin-eof``: it shuts down when the pipe closes, so it does not
+    outlive this process even when that is killed (SIGTERM, SIGKILL, a Jupyter
+    kernel restart, ``docker stop``). ``stop()`` closes the pipe too, which gives
+    a graceful shutdown on every platform.
 
     >>> with Server() as srv:
     ...     r = srv.client()
@@ -112,11 +118,16 @@ class Server:
         raise AssertionError("unreachable")
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Stop the server (SIGTERM, then kill after ``timeout`` seconds). Idempotent."""
+        """Stop the server: close its stdin (graceful shutdown, snapshot written),
+        kill it if it is still running after ``timeout`` seconds. Idempotent."""
         proc, self._proc = self._proc, None
         _live.discard(self)
-        if proc is not None and proc.poll() is None:
-            proc.terminate()
+        if proc is not None:
+            if proc.stdin is not None:
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass
             try:
                 proc.wait(timeout)
             except subprocess.TimeoutExpired:
@@ -157,7 +168,7 @@ class Server:
     # -- internals -----------------------------------------------------------
 
     def _command(self, binary: str, port: int) -> list[str]:
-        cmd = [binary, "--bind", self.host, "--port", str(port)]
+        cmd = [binary, "--exit-on-stdin-eof", "--bind", self.host, "--port", str(port)]
         if self.data_dir is not None:
             cmd += ["--dir", self.data_dir]
         if self.maxmemory is not None:
@@ -168,7 +179,7 @@ class Server:
         log = tempfile.TemporaryFile()
         proc = subprocess.Popen(
             self._command(binary, port),
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE,  # closed when this process exits → server stops
             stdout=subprocess.DEVNULL,
             stderr=log,
         )
@@ -202,7 +213,8 @@ class Server:
         return self._log.read().decode(errors="replace").strip()
 
 
-# Servers still running at interpreter exit are stopped, so no process is left behind.
+# Servers still running at interpreter exit are stopped gracefully (snapshot written).
+# If the interpreter is killed instead, the stdin pipe closes and the server stops itself.
 _live: set[Server] = set()
 
 
