@@ -98,11 +98,11 @@ func TestANNRecall(t *testing.T) {
 		{"ivf", KindIVF, Options{NProbe: 16}, 0.90},
 		{"ivf-sq8", KindIVF, Options{NProbe: 16, Quant: QuantSQ8, Rerank: 2}, 0.88},
 		{"ivf-pq", KindIVF, Options{NProbe: 16, Quant: QuantPQ, PQM: 8, Rerank: 10}, 0.85},
-		{"flat-sq8", KindFlat, Options{Quant: QuantSQ8}, 0.95},
+		{"flat-sq8", KindFlat, Options{Quant: QuantSQ8, Rerank: 2}, 0.97},
 		{"flat-pq", KindFlat, Options{Quant: QuantPQ, PQM: 8, Rerank: 10}, 0.90},
 	}
-	for _, metric := range []Metric{Cosine, L2} {
-		all := clustered(rng, n+100, dim, 50, metric == Cosine)
+	for _, metric := range []Metric{Cosine, L2, IP} {
+		all := clustered(rng, n+100, dim, 50, metric == Cosine) // ip: raw, unnormalized vectors
 		vecs, queries := all[:n], all[n:]
 		for _, tc := range cases {
 			t.Run(metric.String()+"/"+tc.name, func(t *testing.T) {
@@ -257,6 +257,8 @@ func TestValidate(t *testing.T) {
 		{KindIVF, Options{Quant: QuantPQ, PQM: 7}}, // does not divide 32
 		{KindIVF, Options{PQM: 8}},
 		{KindIVF, Options{Rerank: 2}},
+		{KindFlat, Options{Quant: 7}}, // unknown value (e.g. from a snapshot)
+		{KindIVF, Options{Quant: QuantPQ + 1}},
 	}
 	for _, b := range bad {
 		if err := Validate(b.kind, 32, b.o); err == nil {
@@ -294,24 +296,36 @@ func TestSQ8SIMDMatchesScalar(t *testing.T) {
 
 // Repeated delete + re-insert (cache churn) keeps HNSW recall close to a fresh build.
 func TestHNSWChurnKeepsRecall(t *testing.T) {
-	rng := rand.New(rand.NewSource(10))
-	all := clustered(rng, 12100, 32, 50, true)
-	vecs, queries := all[:12000], all[12000:]
-	idx, src := build(t, KindHNSW, Options{EfSearch: 32}, Cosine, vecs)
-	before := recallAt(t, idx, src, Cosine, queries, 10, SearchParams{})
-	for round := 0; round < 3; round++ {
-		perm := rng.Perm(len(vecs))[:len(vecs)*3/10]
-		for _, i := range perm {
-			idx.Remove(uint32(i))
+	// Reused slots get new vectors, as with TTL expiry or eviction followed by new
+	// records. (Re-inserting the same vector into the same slot would flatter a graph
+	// that keeps links to removed nodes: they come back valid.)
+	for _, seed := range []int64{10, 11} {
+		rng := rand.New(rand.NewSource(seed))
+		const n, rounds = 12000, 3
+		churn := n * 3 / 10
+		pool := clustered(rng, n+rounds*churn+1000, 32, 50, true)
+		vecs, extra, queries := pool[:n], pool[n:n+rounds*churn], pool[n+rounds*churn:]
+		idx, src := build(t, KindHNSW, Options{EfSearch: 32}, Cosine, vecs)
+		for round := 0; round < rounds; round++ {
+			perm := rng.Perm(n)[:churn]
+			for _, i := range perm {
+				idx.Remove(uint32(i))
+				src.dead[uint32(i)] = true
+			}
+			for j, i := range perm {
+				v := extra[round*churn+j]
+				src.set(uint32(i), v)
+				idx.Add(uint32(i), v)
+			}
 		}
-		for _, i := range perm {
-			idx.Add(uint32(i), vecs[i])
+		after := recallAt(t, idx, src, Cosine, queries, 10, SearchParams{})
+		fresh, fsrc := build(t, KindHNSW, Options{EfSearch: 32}, Cosine, src.vecs)
+		want := recallAt(t, fresh, fsrc, Cosine, queries, 10, SearchParams{})
+		t.Logf("seed %d: recall@10 after 3 × 30%% churn %.3f, fresh build on the same data %.3f (%s)",
+			seed, after, want, idx.Stats().State)
+		if after < want-0.01 {
+			t.Errorf("seed %d: recall after churn %.3f < fresh %.3f - 0.01", seed, after, want)
 		}
-	}
-	after := recallAt(t, idx, src, Cosine, queries, 10, SearchParams{})
-	t.Logf("recall@10 before %.3f, after 3 × 30%% churn %.3f (%s)", before, after, idx.Stats().State)
-	if after < before-0.01 {
-		t.Errorf("recall dropped %.3f → %.3f", before, after)
 	}
 }
 
@@ -332,5 +346,40 @@ func TestHNSWRemoveAll(t *testing.T) {
 	}
 	if r := recallAt(t, idx, src, Cosine, vecs[:50], 5, SearchParams{}); r < 0.95 {
 		t.Errorf("recall after refill %.3f", r)
+	}
+}
+
+// Links to removed nodes are dropped when a list is touched again (connect),
+// not kept as candidates that block live neighbours in the heuristic.
+func TestHNSWDropsLinksToRemovedNodes(t *testing.T) {
+	rng := rand.New(rand.NewSource(12))
+	vecs := clustered(rng, 6000, 16, 20, true)
+	idx, src := build(t, KindHNSW, Options{}, Cosine, vecs[:3000])
+	h := idx.(*HNSW)
+	dead := func() (n int) {
+		for _, node := range h.nodes {
+			for l, links := range node.links {
+				for _, x := range links {
+					if !h.inLevel(x, l) {
+						n++
+					}
+				}
+			}
+		}
+		return n
+	}
+	for i := 0; i < 1000; i++ {
+		h.Remove(uint32(i))
+		src.dead[uint32(i)] = true
+	}
+	afterRemove := dead()
+	for i := 3000; i < 6000; i++ {
+		src.vecs = append(src.vecs, vecs[i])
+		h.Add(uint32(i), vecs[i])
+	}
+	afterInserts := dead()
+	t.Logf("links to removed nodes: %d after removing 1/3, %d after 3000 inserts", afterRemove, afterInserts)
+	if afterInserts*3 > afterRemove {
+		t.Errorf("dead links %d → %d: not dropped by later inserts", afterRemove, afterInserts)
 	}
 }

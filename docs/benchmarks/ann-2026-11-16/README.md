@@ -26,7 +26,8 @@ Reproduce: `prepare_data.py` → `faiss_bench.py` (writes `gt.i32`) → `go run 
 
 ## Update: AVX2 kernels and HNSW delete repair (same day)
 
-Second run after two changes: AVX2+FMA distance kernels (`GOEXPERIMENT=simd`, DESIGN §7) and
+Second run after two changes: AVX2+FMA distance kernels (`GOEXPERIMENT=simd`, DESIGN §7; opt-in
+with `make build SIMD=1`, release binaries are scalar and match the first run) and
 HNSW deletes that repair the graph instead of leaving tombstones (TD-3). Same machine, data
 and harness; raw results in `results-*-simd.json`. Recall is unchanged to 4 decimals (the
 SIMD kernels compute the same distances).
@@ -52,6 +53,10 @@ Over RESP: HNSW M=16 ef=64 p50 0.69 → **0.52 ms**, VADD 917 → **1,541/s**; I
 Churn (3 × 30% delete + re-insert, ef=64): HNSW recall 0.979 → **0.971** (was → 0.954 with
 tombstones); the graph still ends with 8% fewer links (heuristic pruning during repair).
 IVF unchanged (0.942).
+
+2026-11-19 (review of PR #3): `connect` now also drops links to removed nodes. Same churn run:
+0.979 → **0.9717** (`results-churn-fix.json`), i.e. unchanged; the graph still ends with 8%
+fewer links (2,126,118 vs 2,314,641), which is where the remaining loss comes from (TD-3).
 
 Gap to Faiss per query is now 1.1× (flat), 1.3× (HNSW), 1.4–1.5× (SQ8), 1.7× (IVF-Flat). PQ
 did not move (2–3×): ADC table lookups and PQ training run on 16-dim sub-vectors, below the

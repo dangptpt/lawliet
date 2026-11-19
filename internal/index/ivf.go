@@ -226,7 +226,7 @@ func (x *IVF) train() {
 		}
 	} else {
 		km := min(sampleSize, maxTrainPerCell*nlist) // the sample is a random permutation: any prefix is random
-		x.cent = kmeans(sample[:km*x.dim], x.dim, nlist, kmeansIters, x.metric == Cosine, 1)
+		x.cent = kmeans(sample[:km*x.dim], x.dim, nlist, kmeansIters, x.metric != L2, 1)
 	}
 	x.centNorms = nil
 	if x.metric == L2 && nlist > 1 {
@@ -246,7 +246,7 @@ func (x *IVF) train() {
 		m := orDefault(x.opts.PQM, autoPQM(x.dim))
 		assign := make([]int32, sampleSize)
 		if nlist > 1 {
-			assignNearest(sample, x.dim, x.cent, x.metric == Cosine, assign)
+			assignNearest(sample, x.dim, x.cent, x.metric != L2, assign)
 		}
 		res := make([]float32, len(sample))
 		for i := 0; i < sampleSize; i++ {

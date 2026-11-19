@@ -98,8 +98,12 @@ No single `VADD` exceeds 50 ms while an IVF collection grows from 0 to 100k reco
 - **Recorded:** 2026-11-16 (ANN spike)
 - **Status:** partly fixed 2026-11-16 — deletes repair neighbors (fix option 1): after 3 × 30%
   churn recall@10 is 0.971 instead of 0.954 (fresh build 0.979). Not yet within the 0.005 target;
-  the repaired graph has 8% fewer links. Next: refill pruned links up to M (keep pruned
-  connections) or option 2.
+  the repaired graph has 8% fewer links. 2026-11-19: `connect` also drops links to removed
+  nodes (2,493 → 4 dead links in `TestHNSWDropsLinksToRemovedNodes`); real-data churn recall
+  is unchanged by it (0.9717 vs 0.9713, `results-churn-fix.json`), so the remaining loss comes
+  from the 8% of links pruned during repair. Next: refill pruned links up to M (keep pruned
+  connections) or option 2. Note: the benchmark re-inserts the same vectors; with new vectors
+  in re-used slots (unit test, 6 seeds) churned and fresh graphs differ by ≤ 0.004.
 - **Design reference:** DESIGN.md §7.3, §16.3
 
 ### Problem
@@ -120,3 +124,54 @@ exactly this pattern.
 ### Done when
 
 Recall after 3 × 30% churn stays within 0.005 of the fresh build in the benchmark.
+
+---
+
+## TD-4: index memory is outside `--maxmemory`
+
+- **Recorded:** 2026-11-19 (review of the ANN indexes)
+- **Status:** open — related to TD-1
+- **Design reference:** DESIGN.md §7.1, §8.2
+
+### Problem
+
+`--maxmemory` counts records (vectors, text, metadata), not index structures. At 100k × 1024
+(`docs/benchmarks/ann-2026-11-16`): HNSW M=16 adds 18 MiB (≈ 180 B/vector), M=32 30 MiB,
+IVF-SQ8 113 MiB (+DIM bytes/vector), IVF-PQ 11 MiB. `VINFO index_bytes` reports it, but eviction
+does not see it, so a collection with `QUANT sq8` can use ~25% more than the limit on top of
+TD-1.
+
+### Fix options
+
+1. Add `index_bytes` to the memory estimate used by eviction (per-vector cost known per kind).
+2. Report it in `INFO memory` as a separate field at least.
+
+### Done when
+
+The memory estimate used for `--maxmemory` includes index structures, and `INFO memory` shows
+them.
+
+---
+
+## TD-5: full scans under the write lock in HNSW
+
+- **Recorded:** 2026-11-19 (review of the ANN indexes)
+- **Status:** open
+- **Design reference:** DESIGN.md §7.3
+
+### Problem
+
+- Removing the entry point calls `pickEntry`, which scans every node for the highest level,
+  under the collection write lock: O(n) for that delete (~0.1 ms per 100k nodes, not measured).
+- `Stats()` walks every link list on each `VINFO` (under the read lock) to count links and bytes.
+
+### Fix options
+
+1. Keep per-level node counts (or a small set of top-level nodes) so a new entry point is found
+   without a full scan.
+2. Maintain link and byte counters incrementally in `connect` / `repair` / `Remove`.
+
+### Done when
+
+Neither a delete nor `VINFO` scans the whole graph.
+

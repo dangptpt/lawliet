@@ -192,7 +192,8 @@ roadmap) is needed.
 ## Limitations
 
 - **Approximate indexes are new** (`INDEX hnsw|ivf`, `QUANT sq8|pq`): recall matches Faiss, but
-  queries are 1.1–1.7× slower than Faiss (2–3× for PQ), IVF/PQ training blocks one `VADD` for
+  queries are 1.7–3× slower than Faiss in release builds (scalar), 1.1–1.7× with the opt-in AVX2
+  kernels (`make build SIMD=1`, experimental Go flag; PQ 2–3×), IVF/PQ training blocks one `VADD` for
   up to seconds ([TD-2](TECH_DEBT.md)) and HNSW loses ~0.01 recall under heavy churn
   ([TD-3](TECH_DEBT.md)).
   [Benchmark](docs/benchmarks/ann-2026-11-16/README.md). One query uses one CPU core.

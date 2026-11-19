@@ -96,6 +96,9 @@ func Validate(kind string, dim int, o Options) error {
 		}
 		return nil
 	}
+	if o.Quant > QuantPQ { // VCREATE parses names; this catches snapshots and other callers
+		return fmt.Errorf("unknown QUANT %d", uint8(o.Quant))
+	}
 	switch kind {
 	case KindFlat:
 		if err := check(set("M", o.M), set("EF_CONSTRUCTION", o.EfConstruction), set("EF_SEARCH", o.EfSearch),

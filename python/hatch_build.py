@@ -10,6 +10,8 @@ Environment variables:
                      run this hook from python/.
                      Default: build it with `go build` from the repository
                      (needs Go and the Go sources next to this directory).
+                     GOEXPERIMENT=simd in the environment builds the AVX2
+                     kernels (experimental; release wheels are scalar).
 
 Wheels only: the sdist does not contain the Go sources, so a wheel built from
 it needs LAWLIET_BINARY. Editable installs stay pure Python and find the binary
@@ -102,7 +104,7 @@ class CustomBuildHook(BuildHookInterface):
         if go is None:
             raise RuntimeError("go not found on PATH: install Go or set LAWLIET_BINARY")
         goos, goarch = target.split("/")
-        env = {**os.environ, "CGO_ENABLED": "0", "GOOS": goos, "GOARCH": goarch, "GOEXPERIMENT": "simd"}
+        env = {**os.environ, "CGO_ENABLED": "0", "GOOS": goos, "GOARCH": goarch}
         ldflags = f"-s -w -X {_VERSION_VAR}=v{self.metadata.version}"
         subprocess.run(
             [go, "build", "-trimpath", "-ldflags", ldflags, "-o", str(out), "./cmd/lawliet"],

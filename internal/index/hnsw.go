@@ -162,7 +162,7 @@ func (h *HNSW) repair(n, removed uint32, extra []uint32, l int) {
 	vn := h.src.Vector(n)
 	cs := make([]cand, 0, len(links)+len(extra))
 	add := func(x uint32) {
-		if x == n || x == removed || int(h.nodes[x].level) < l {
+		if x == n || x == removed || !h.inLevel(x, l) {
 			return
 		}
 		for _, c := range cs {
@@ -197,16 +197,25 @@ func (h *HNSW) pickEntry() {
 	}
 }
 
+// inLevel reports whether slot x is in the graph at level l (false once removed).
+func (h *HNSW) inLevel(x uint32, l int) bool { return int(h.nodes[x].level) >= l }
+
 // connect adds a link from n to s at level l, shrinking n's list with the heuristic when full.
 func (h *HNSW) connect(n, s uint32, d float32, l int) {
 	node := &h.nodes[n]
 	if int(node.level) < l {
 		return
 	}
-	links := node.links[l]
-	for _, x := range links {
-		if x == s {
-			return
+	if slices.Contains(node.links[l], s) {
+		return
+	}
+	// Drop links to removed nodes first. Remove repairs only the lists of the removed
+	// node's own neighbours, so a one-way link to it stays until its list is touched
+	// here; kept as a candidate it would also block live ones in the diversity heuristic.
+	links := node.links[l][:0]
+	for _, x := range node.links[l] {
+		if h.inLevel(x, l) {
+			links = append(links, x)
 		}
 	}
 	if len(links) < h.maxLinks(l) {

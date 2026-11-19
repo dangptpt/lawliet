@@ -16,7 +16,9 @@
 // Version history: 1 = MVP; 2 = adds the semantic cache defaults per collection;
 // 3 = adds hnsw/ivf indexes and their options. Index structures are not stored:
 // they are rebuilt while records are restored.
-// Readers accept every version up to the current one.
+// Readers accept every version up to the current one. Writers use the lowest
+// version that holds the data: 2 while every collection is flat with default
+// options, so an older binary (v0.2.x) can still read the file.
 package snapshot
 
 import (
@@ -86,6 +88,17 @@ func (e *encoder) vec(v []float32) {
 	}
 }
 
+// writeVersion is the lowest format version that can hold cols: 3 only when a
+// collection uses an index other than plain flat (v3 fields), else 2.
+func writeVersion(cols []*store.Collection) uint16 {
+	for _, c := range cols {
+		if cfg := c.Config(); cfg.Index != index.KindFlat || cfg.IndexOpts != (index.Options{}) {
+			return version
+		}
+	}
+	return 2
+}
+
 // Write encodes all collections of st to w. Each collection is dumped under
 // its read lock, one at a time.
 func Write(w io.Writer, st *store.Store) (Stats, error) {
@@ -95,8 +108,9 @@ func Write(w io.Writer, st *store.Store) (Stats, error) {
 
 	var stats Stats
 	cols := st.Collections()
+	fileVersion := writeVersion(cols)
 	e.w.WriteString(magic)
-	e.u16(version)
+	e.u16(fileVersion)
 	e.u32(uint32(len(cols)))
 	for _, c := range cols {
 		err := c.Dump(
@@ -118,10 +132,12 @@ func Write(w io.Writer, st *store.Store) (Stats, error) {
 				}
 				e.f64(h.Config.CacheThreshold)
 				e.i64(h.Config.CacheTTL)
-				o := h.Config.IndexOpts
-				e.u8(uint8(o.Quant))
-				for _, v := range []int{o.M, o.EfConstruction, o.EfSearch, o.NList, o.NProbe, o.PQM, o.Rerank} {
-					e.u32(uint32(v))
+				if fileVersion >= 3 {
+					o := h.Config.IndexOpts
+					e.u8(uint8(o.Quant))
+					for _, v := range []int{o.M, o.EfConstruction, o.EfSearch, o.NList, o.NProbe, o.PQM, o.Rerank} {
+						e.u32(uint32(v))
+					}
 				}
 				e.u32(uint32(h.Count))
 				return nil

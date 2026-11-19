@@ -292,7 +292,8 @@ VCONFIG <col> SET CACHE_TTL <sec>                                       → +OK
 
 `VINFO` reply is a map (flat array in RESP2). Fields: `name, dim, metric, index, count, expires,
 max_vectors, policy, cache_threshold` (null if unset), `cache_ttl, memory_bytes` (estimated,
-§8.2), `vector_bytes` (allocated slab). `VCONFIG GET` returns `max_vectors, policy,
+§8.2), `vector_bytes` (allocated slab), then `index_params, index_state, index_bytes` (§7.1; added
+last so positional RESP2 parsers are not affected). `VCONFIG GET` returns `max_vectors, policy,
 cache_threshold, cache_ttl`.
 
 `VCONFIG <col> SET` accepts several `param value` pairs; all are validated before any change is
@@ -488,8 +489,11 @@ Options that do not apply to the kind are rejected by `VCREATE`. `VINFO` reports
 not counted by `maxmemory`).
 
 Distances (`internal/vecmath`) use AVX2 + FMA when built with `GOEXPERIMENT=simd` on amd64
-and the CPU has them (`INFO server` → `vector_simd`); otherwise unrolled scalar loops. Release
-builds, the Dockerfile and `make` set `GOEXPERIMENT=simd`. Each kernel ends with `VZEROUPPER`
+and the CPU has them (`INFO server` → `vector_simd`); otherwise unrolled scalar loops.
+`GOEXPERIMENT=simd` is an experimental toolchain flag, so it is **opt-in**: release binaries,
+wheels and the Docker image are scalar by default; `make build SIMD=1`,
+`docker build --build-arg SIMD=1` or `GOEXPERIMENT=simd` for the wheel hook build the AVX2
+path. CI tests both builds. Each kernel ends with `VZEROUPPER`
 (`archsimd.ClearAVXUpperBits`): without it Go's SSE scalar code after an AVX kernel pays the
 AVX→SSE transition penalty (measured 3× slower overall). Results can differ from the scalar
 path in the last bits.
@@ -508,7 +512,8 @@ path in the last bits.
   removal half of an update) takes the node out and repairs the graph: each neighbor that
   linked to it re-selects its links with the heuristic among its other links and the removed
   node's links (as hnswlib does). Links from nodes the removed one did not link to are left
-  dangling and skipped while searching.
+  dangling and skipped while searching; they are dropped the next time that list gets a new
+  link (`connect`), so they neither occupy slots nor block live candidates in the heuristic.
 - Search: greedy descent, then a beam of `max(EF, K)` on level 0. `FILTER` is applied to results
   while traversing; if fewer than K matches are found the query falls back to an exact scan.
 
@@ -706,9 +711,11 @@ the scores).
 Bad magic / version / CRC → refuse to start with a clear error.
 
 Versions: **1** = v0.1.0; **2** = adds the cache defaults per collection; **3** = adds index
-kinds and options (index structures are rebuilt on load). The server writes
-the current version and reads every version up to it (a v1 file loads with no cache
-defaults; `internal/snapshot/testdata/v1.lwdb` guards this).
+kinds and options (index structures are rebuilt on load). The server writes the lowest
+version that holds the data — v2 while every collection is `flat` with default options, so
+a v0.2.x binary can still read it; v3 otherwise — and reads every version up to the current
+one (a v1 file loads with no cache defaults; `internal/snapshot/testdata/v1.lwdb` guards
+this).
 
 `INFO persistence`: `snapshot_enabled`, `snapshot_path`, `rdb_changes_since_last_save`,
 `rdb_last_save_time`, `rdb_last_save_status`, `rdb_last_save_duration_ms`.

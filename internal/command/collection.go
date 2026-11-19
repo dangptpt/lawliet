@@ -139,12 +139,6 @@ func (h *handlers) vinfo(c *server.Conn, args [][]byte) {
 	w.WriteBulkString(info.Config.Metric.String())
 	w.WriteBulkString("index")
 	w.WriteBulkString(info.Config.Index)
-	w.WriteBulkString("index_params")
-	w.WriteBulkString(index.Describe(info.Config.Index, info.Config.Dim, info.Config.IndexOpts))
-	w.WriteBulkString("index_state")
-	w.WriteBulkString(info.IndexStats.State)
-	w.WriteBulkString("index_bytes")
-	w.WriteInt(info.IndexStats.Bytes)
 	w.WriteBulkString("count")
 	w.WriteInt(int64(info.Count))
 	w.WriteBulkString("expires")
@@ -158,6 +152,13 @@ func (h *handlers) vinfo(c *server.Conn, args [][]byte) {
 	w.WriteInt(info.MemoryBytes)
 	w.WriteBulkString("vector_bytes")
 	w.WriteInt(info.VectorBytes)
+	// Added with the ANN indexes: appended so positional RESP2 parsers keep working.
+	w.WriteBulkString("index_params")
+	w.WriteBulkString(index.Describe(info.Config.Index, info.Config.Dim, info.Config.IndexOpts))
+	w.WriteBulkString("index_state")
+	w.WriteBulkString(info.IndexStats.State)
+	w.WriteBulkString("index_bytes")
+	w.WriteInt(info.IndexStats.Bytes)
 }
 
 // VCONFIG <col> GET

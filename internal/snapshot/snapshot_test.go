@@ -405,11 +405,27 @@ func TestReadVersion1File(t *testing.T) {
 	}
 }
 
-func TestWritesCurrentVersion(t *testing.T) {
-	var buf bytes.Buffer
-	Write(&buf, newStore(&clock{}))
-	if got := int(buf.Bytes()[4]) | int(buf.Bytes()[5])<<8; got != version || version != 3 {
-		t.Fatalf("written version %d, const %d", got, version)
+// Flat-only stores are written as v2 (readable by v0.2.x); any hnsw/ivf/quantized
+// collection needs v3.
+func TestWrittenVersion(t *testing.T) {
+	written := func(s *store.Store) int {
+		var buf bytes.Buffer
+		if _, err := Write(&buf, s); err != nil {
+			t.Fatal(err)
+		}
+		return int(buf.Bytes()[4]) | int(buf.Bytes()[5])<<8
+	}
+	s := newStore(&clock{})
+	fill(t, s, 0)
+	if got := written(s); got != 2 {
+		t.Fatalf("flat-only store written as v%d, want 2", got)
+	}
+	if _, err := s.Create("q", store.Config{Dim: 8, Metric: index.L2, Index: "flat",
+		IndexOpts: index.Options{Quant: index.QuantSQ8}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := written(s); got != 3 || version != 3 {
+		t.Fatalf("store with flat+sq8 written as v%d, want 3 (const %d)", got, version)
 	}
 }
 
